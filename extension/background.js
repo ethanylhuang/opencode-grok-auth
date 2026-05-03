@@ -5,18 +5,24 @@ const POLL_BACKOFF_MS = 1000;
 const JOB_RUN_TIMEOUT_MS = 180000;
 
 let lastObservedRequest = null;
+let lastObservedNewRequest = null;
 let lastTemplateInstallSource = '';
 let lastTemplateInstallError = '';
 let polling = false;
 const activeJobs = new Map();
 const jobPostChains = new Map();
 
-chrome.storage.local.get(['lastObservedRequest'], (result) => {
+chrome.storage.local.get(['lastObservedRequest', 'lastObservedNewRequest'], (result) => {
   if (isValidObservedRequest(result.lastObservedRequest)) {
     installObservedRequest(result.lastObservedRequest, 'storage');
   } else if (result.lastObservedRequest) {
     lastTemplateInstallError = observedRequestInvalidReason(result.lastObservedRequest);
     chrome.storage.local.remove('lastObservedRequest');
+  }
+  if (isValidObservedRequest(result.lastObservedNewRequest)) {
+    installObservedRequest(result.lastObservedNewRequest, 'storage');
+  } else if (result.lastObservedNewRequest) {
+    chrome.storage.local.remove('lastObservedNewRequest');
   }
 });
 
@@ -145,10 +151,15 @@ function rememberObservedRequest(detail) {
 }
 
 function installObservedRequest(observedRequest, source = 'unknown') {
-  lastObservedRequest = observedRequest;
+  if (conversationIdFromResponseUrl(observedRequest.url) === 'new') {
+    lastObservedNewRequest = observedRequest;
+    chrome.storage.local.set({ lastObservedNewRequest });
+  } else {
+    lastObservedRequest = observedRequest;
+    chrome.storage.local.set({ lastObservedRequest });
+  }
   lastTemplateInstallSource = source;
   lastTemplateInstallError = '';
-  chrome.storage.local.set({ lastObservedRequest });
 }
 
 function isValidObservedRequest(request) {
@@ -165,9 +176,11 @@ function observedRequestInvalidReason(request) {
     return 'url is not a Grok response endpoint';
   }
 
-  const parentResponseId = request.body.parentResponseId;
-  if (typeof parentResponseId !== 'string' || parentResponseId.length === 0) {
-    return 'missing parentResponseId';
+  if (urlConversationId !== 'new') {
+    const parentResponseId = request.body.parentResponseId;
+    if (typeof parentResponseId !== 'string' || parentResponseId.length === 0) {
+      return 'missing parentResponseId';
+    }
   }
 
   if (request.body.disableMemory === true) {
@@ -184,6 +197,9 @@ function observedRequestInvalidReason(request) {
 function conversationIdFromResponseUrl(value) {
   try {
     const parsed = new URL(value);
+    if (parsed.pathname === '/rest/app-chat/conversations/new') {
+      return 'new';
+    }
     const match = parsed.pathname.match(/^\/rest\/app-chat\/conversations\/([^/]+)\/responses$/);
     return match?.[1] || '';
   } catch {
@@ -272,6 +288,11 @@ async function postHeartbeat() {
         lastTemplateInstallError = observedRequestInvalidReason(body.templateOverride);
       }
     }
+    if (body && body.newTemplateOverride) {
+      if (isValidObservedRequest(body.newTemplateOverride)) {
+        installObservedRequest(body.newTemplateOverride, 'proxy-new-template-override');
+      }
+    }
   }
 }
 
@@ -329,13 +350,19 @@ async function postJobComplete(jobId, ok, error) {
 }
 
 async function runJobInGrokTab(job) {
-  const requestTemplate = isValidObservedRequest(job.requestTemplate) ? job.requestTemplate : lastObservedRequest;
+  console.log('[bridge] runJobInGrokTab', { jobId: job.id, model: job.model });
+
+  const isNew = job.model === 'grok-latest-new';
+  const fallbackTemplate = isNew ? lastObservedNewRequest : lastObservedRequest;
+  const requestTemplate = isValidObservedRequest(job.requestTemplate) ? job.requestTemplate : fallbackTemplate;
+
+  console.log('[bridge] template', { isNew, templateUrl: requestTemplate?.url });
 
   if (!requestTemplate) {
     await postJobComplete(
       job.id,
       false,
-      'No Grok request template captured. Open grok.com and send one normal message before using OpenCode.',
+      isNew ? 'No new conversation template captured. Send a first message in a new Grok tab.' : 'No Grok request template captured. Open grok.com and send one normal message before using OpenCode.',
     );
     return;
   }

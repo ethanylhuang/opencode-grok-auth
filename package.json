@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "test-endpoint": "tsx scripts/test-grok-endpoint.ts",
+    "test-new-conversation": "tsx scripts/test-new-conversation.ts",
     "proxy": "npm run build && node dist/proxy.js",
     "proxy:dev": "tsx src/proxy.ts",
     "test-bridge": "tsx scripts/test-bridge-flow.ts",

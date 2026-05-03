@@ -27,7 +27,7 @@
                     Refresh
                 </button>
             </div>
-            <div id="healthGrid" class="grid gap-px bg-zinc-800 text-xs sm:grid-cols-3 lg:grid-cols-6"></div>
+            <div id="healthGrid" class="grid gap-px bg-zinc-800 text-xs sm:grid-cols-3 lg:grid-cols-7"></div>
             <div id="healthDetail" class="border-t border-zinc-800 px-4 py-2 font-mono text-[11px] text-zinc-500"></div>
         </section>
 
@@ -48,6 +48,10 @@
                    class="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
                    placeholder="Enter prompt..."
                    autocomplete="off">
+            <label class="flex items-center gap-2 text-sm text-zinc-300">
+                <input type="checkbox" id="newConversation" class="rounded border-zinc-700 bg-zinc-900 text-sky-500 focus:ring-sky-500">
+                New Chat
+            </label>
             <button id="sendBtn" type="submit"
                     class="rounded bg-sky-600 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400">
                 Send
@@ -75,6 +79,7 @@
 
         const form = document.getElementById('promptForm');
         const promptInput = document.getElementById('prompt');
+        const newConversationCheckbox = document.getElementById('newConversation');
         const outputDiv = document.getElementById('output');
         const sendBtn = document.getElementById('sendBtn');
         const statusDiv = document.getElementById('status');
@@ -120,6 +125,7 @@
             markClient('requestStartedAt');
 
             try {
+                const modelToUse = newConversationCheckbox.checked ? 'grok-latest-new' : 'grok-latest';
                 const response = await fetch(`${PROXY_URL}/v1/chat/completions`, {
                     method: 'POST',
                     headers: {
@@ -127,7 +133,7 @@
                         'X-Grok-Debug-Timing': '1',
                     },
                     body: JSON.stringify({
-                        model: 'grok-latest',
+                        model: modelToUse,
                         messages: [{ role: 'user', content: prompt }],
                         stream: true,
                     }),
@@ -218,6 +224,7 @@
                 healthCell('Extension', boolText(bridge.connected), bridge.connected === true),
                 healthCell('Grok Tab', boolText(bridge.activeGrokTab), bridge.activeGrokTab === true),
                 healthCell('Template', boolText(bridge.hasRequestTemplate), bridge.hasRequestTemplate === true),
+                healthCell('New Tmpl', boolText(bridge.proxyHasNewTemplateOverride), bridge.proxyHasNewTemplateOverride === true),
                 healthCell('Queued', valueText(jobs.queued), jobs.queued === 0),
                 healthCell('Failed', valueText(metrics.failedJobs), (metrics.failedJobs || 0) === 0),
             ].join('');

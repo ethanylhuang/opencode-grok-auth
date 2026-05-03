@@ -86,7 +86,7 @@
   function isGrokResponseUrl(url) {
     try {
       const parsed = new URL(url, location.origin);
-      return parsed.origin === location.origin && /^\/rest\/app-chat\/conversations\/[^/]+\/responses$/.test(parsed.pathname);
+      return parsed.origin === location.origin && /^\/rest\/app-chat\/conversations\/(new|[^/]+\/responses)$/.test(parsed.pathname);
     } catch {
       return false;
     }
@@ -124,6 +124,7 @@
   }
 
   async function runGrokJob(runId, job, requestTemplate) {
+    console.log('[injected] runGrokJob called', { runId, jobId: job?.id, templateUrl: requestTemplate?.url });
     if (!job || typeof job.id !== 'string') {
       return;
     }
@@ -171,6 +172,14 @@
       [BRIDGE_REPLAY_MARKER]: true,
     });
     markPageTiming(runId, job.id, jobTimings, 'grokResponseHeadersAt');
+
+    console.log('[injected] directGrokFetch response', {
+      status: response.status,
+      statusText: response.statusText,
+      contentType: response.headers.get('content-type'),
+      url: requestTemplate.url,
+    });
+
     return response;
   }
 
@@ -220,34 +229,39 @@
   }
 
   async function streamGrokResponse(runId, jobId, response, jobTimings) {
-    if (!response.body) {
-      throw new Error('Grok upstream response did not include a readable stream.');
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let firstRawChunk = true;
-
-    while (true) {
-      const read = await reader.read();
-      if (read.done) {
-        break;
+    try {
+      if (!response.body) {
+        throw new Error('Grok upstream response did not include a readable stream.');
       }
 
-      const chunk = decoder.decode(read.value, { stream: true });
-      if (chunk) {
-        const timings = firstRawChunk ? { ...jobTimings, firstRawUpstreamChunkAt: Date.now() } : undefined;
-        firstRawChunk = false;
-        postPageMessage('GROK_JOB_CHUNK', runId, jobId, { chunk, timings });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let firstRawChunk = true;
+
+      while (true) {
+        const read = await reader.read();
+        if (read.done) {
+          break;
+        }
+
+        const chunk = decoder.decode(read.value, { stream: true });
+        if (chunk) {
+          const timings = firstRawChunk ? { ...jobTimings, firstRawUpstreamChunkAt: Date.now() } : undefined;
+          firstRawChunk = false;
+          postPageMessage('GROK_JOB_CHUNK', runId, jobId, { chunk, timings });
+        }
       }
-    }
 
-    const tail = decoder.decode();
-    if (tail) {
-      postPageMessage('GROK_JOB_CHUNK', runId, jobId, { chunk: tail });
-    }
+      const tail = decoder.decode();
+      if (tail) {
+        postPageMessage('GROK_JOB_CHUNK', runId, jobId, { chunk: tail });
+      }
 
-    postPageMessage('GROK_JOB_COMPLETE', runId, jobId);
+      postPageMessage('GROK_JOB_COMPLETE', runId, jobId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      postPageMessage('GROK_JOB_ERROR', runId, jobId, { error: `streamGrokResponse failed: ${message}` });
+    }
   }
 
   async function submitPromptToGrokUi(prompt) {

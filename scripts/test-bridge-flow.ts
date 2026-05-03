@@ -96,6 +96,44 @@ async function main() {
     });
     await postJson(`/bridge/jobs/${job.id}/complete`, { ok: true });
 
+    // Test new conversation proxy logic
+    await postJson('/bridge/template', {
+      url: 'https://grok.com/rest/app-chat/conversations/new',
+      body: {
+        temporary: false,
+        message: "hello",
+      },
+      headers: { accept: '*/*' }
+    });
+
+    const newChatResponsePromise = fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'grok-latest-new',
+        stream: true,
+        messages: [{ role: 'user', content: 'Say Hello new world.' }],
+      }),
+    });
+
+    await sleep(100);
+
+    const newJobResponse = await fetch(`${baseUrl}/bridge/jobs?workerId=test-extension`);
+    if (!newJobResponse.ok) {
+      throw new Error(`Expected new bridge job, got HTTP ${newJobResponse.status}`);
+    }
+
+    const newJob = (await newJobResponse.json()) as { id: string; prompt: string; requestTemplate: any };
+    if (!newJob.requestTemplate || newJob.requestTemplate.url !== 'https://grok.com/rest/app-chat/conversations/new') {
+      throw new Error(`Expected newTemplateOverride to be returned, got ${JSON.stringify(newJob.requestTemplate)}`);
+    }
+
+    await postJson(`/bridge/jobs/${newJob.id}/chunks`, { chunk: '{"result":{"token":"Hello new world"}}' });
+    await postJson(`/bridge/jobs/${newJob.id}/complete`, { ok: true });
+    await newChatResponsePromise;
+
     const sse = await chatResponse.text();
     const tokenText = extractSseText(sse);
     const metrics = await getJson('/metrics');

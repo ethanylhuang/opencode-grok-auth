@@ -73,6 +73,7 @@ type BridgeJob = {
   request: OpenAIChatRequest;
   prompt: string;
   model: string;
+  isNewConversation: boolean;
   text: string;
   parserBuffer: string;
   error: string | null;
@@ -115,6 +116,7 @@ let lastHeartbeat = {
   templateInstallError: '',
 };
 let templateOverride: BridgeTemplate | null = null;
+let newTemplateOverride: BridgeTemplate | null = null;
 let lastTemplateRecoveryAt = 0;
 
 function isLocalAddress(address: string | undefined): boolean {
@@ -219,6 +221,9 @@ function flattenMessages(messages: ChatMessage[]): string {
 function conversationIdFromResponseUrl(value: string): string {
   try {
     const parsed = new URL(value);
+    if (parsed.pathname === '/rest/app-chat/conversations/new') {
+      return 'new';
+    }
     const match = parsed.pathname.match(/^\/rest\/app-chat\/conversations\/([^/]+)\/responses$/);
     return match?.[1] || '';
   } catch {
@@ -256,13 +261,15 @@ function isValidBridgeTemplate(value: unknown): value is BridgeTemplate {
   }
 
   const refererConversationId = conversationIdFromReferer(template.referer);
-  if (refererConversationId && refererConversationId !== urlConversationId) {
+  if (urlConversationId !== 'new' && refererConversationId && refererConversationId !== urlConversationId) {
     return false;
   }
 
   const body = template.body as Record<string, unknown>;
-  if (typeof body.parentResponseId !== 'string' || body.parentResponseId.length === 0) {
-    return false;
+  if (urlConversationId !== 'new') {
+    if (typeof body.parentResponseId !== 'string' || body.parentResponseId.length === 0) {
+      return false;
+    }
   }
 
   return body.disableMemory !== true && body.forceConcise !== true;
@@ -353,13 +360,15 @@ function parseJsonObjectAt(text: string, start: number): unknown | null {
   return null;
 }
 
-function recoverTemplateOverrideFromChromeStorage(): BridgeTemplate | null {
+function recoverTemplatesFromChromeStorage(): { regular: BridgeTemplate | null; newConv: BridgeTemplate | null } {
   const storageDir = path.join(CHROME_PROFILE_DIR, 'Local Extension Settings', CHROME_EXTENSION_ID);
   if (!fs.existsSync(storageDir)) {
-    return null;
+    return { regular: null, newConv: null };
   }
 
-  const candidates: BridgeTemplate[] = [];
+  const regularCandidates: BridgeTemplate[] = [];
+  const newCandidates: BridgeTemplate[] = [];
+
   for (const fileName of fs.readdirSync(storageDir)) {
     if (!/\.(log|ldb)$/.test(fileName)) {
       continue;
@@ -369,30 +378,45 @@ function recoverTemplateOverrideFromChromeStorage(): BridgeTemplate | null {
     for (let start = text.indexOf('{"body":'); start !== -1; start = text.indexOf('{"body":', start + 1)) {
       const parsed = parseJsonObjectAt(text, start);
       if (isValidBridgeTemplate(parsed)) {
-        candidates.push(normalizeBridgeTemplate(parsed));
+        const normalized = normalizeBridgeTemplate(parsed);
+        const convId = conversationIdFromResponseUrl(normalized.url as string);
+        if (convId === 'new') {
+          newCandidates.push(normalized);
+        } else {
+          regularCandidates.push(normalized);
+        }
       }
     }
   }
 
-  candidates.sort((left, right) => Number(right.observedAt ?? 0) - Number(left.observedAt ?? 0));
-  return candidates[0] ?? null;
+  regularCandidates.sort((left, right) => Number(right.observedAt ?? 0) - Number(left.observedAt ?? 0));
+  newCandidates.sort((left, right) => Number(right.observedAt ?? 0) - Number(left.observedAt ?? 0));
+
+  return {
+    regular: regularCandidates[0] ?? null,
+    newConv: newCandidates[0] ?? null,
+  };
 }
 
 function ensureTemplateOverrideRecovered(): void {
-  if (templateOverride || Date.now() - lastTemplateRecoveryAt < TEMPLATE_RECOVERY_INTERVAL_MS) {
+  if ((templateOverride && newTemplateOverride) || Date.now() - lastTemplateRecoveryAt < TEMPLATE_RECOVERY_INTERVAL_MS) {
     return;
   }
 
   lastTemplateRecoveryAt = Date.now();
   try {
-    const recovered = recoverTemplateOverrideFromChromeStorage();
-    if (recovered) {
-      templateOverride = recovered;
-      console.log(`Recovered Grok request template from Chrome storage: ${String(recovered.url)}`);
+    const { regular, newConv } = recoverTemplatesFromChromeStorage();
+    if (regular) {
+      templateOverride = regular;
+      console.log(`Recovered regular Grok request template from Chrome storage: ${regular.url}`);
+    }
+    if (newConv) {
+      newTemplateOverride = newConv;
+      console.log(`Recovered new-conversation Grok request template from Chrome storage: ${newConv.url}`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`Could not recover Grok request template from Chrome storage: ${message}`);
+    console.warn(`Could not recover Grok request templates from Chrome storage: ${message}`);
   }
 }
 
@@ -402,15 +426,17 @@ function bridgeStatus() {
   const ageMs = lastHeartbeat.at === 0 ? null : Date.now() - lastHeartbeat.at;
   const connected = ageMs !== null && ageMs <= EXTENSION_TTL_MS;
   const proxyHasTemplateOverride = Boolean(templateOverride);
+  const proxyHasNewTemplateOverride = Boolean(newTemplateOverride);
 
   return {
     connected,
     ageMs,
     workerId: lastHeartbeat.workerId || null,
     activeGrokTab: lastHeartbeat.activeGrokTab,
-    hasRequestTemplate: lastHeartbeat.hasRequestTemplate || proxyHasTemplateOverride,
+    hasRequestTemplate: lastHeartbeat.hasRequestTemplate || proxyHasTemplateOverride || proxyHasNewTemplateOverride,
     extensionHasRequestTemplate: lastHeartbeat.hasRequestTemplate,
     proxyHasTemplateOverride,
+    proxyHasNewTemplateOverride,
     url: lastHeartbeat.url || null,
     manifestVersion: lastHeartbeat.manifestVersion || null,
     backgroundCodeVersion: lastHeartbeat.backgroundCodeVersion || null,
@@ -438,6 +464,7 @@ function createJob(
   options: { requestReceivedAt: number; debugTiming: boolean },
 ): BridgeJob {
   const queuedAt = Date.now();
+  const isNewConversation = request.model === 'grok-latest-new';
   const job: BridgeJob = {
     id: randomUUID(),
     createdAt: queuedAt,
@@ -446,6 +473,7 @@ function createJob(
     request,
     prompt,
     model: request.model ?? 'grok-latest',
+    isNewConversation,
     text: '',
     parserBuffer: '',
     error: null,
@@ -676,20 +704,35 @@ function tokenFromGrokObject(value: unknown): string | null {
     return null;
   }
 
-  const object = value as {
-    token?: unknown;
-    result?: {
-      token?: unknown;
-      isThinking?: unknown;
-    };
-  };
+  const object = value as Record<string, unknown>;
 
-  if (object.result && object.result.isThinking !== true && typeof object.result.token === 'string') {
-    return object.result.token;
+  // Handle /new format: {"result":{"response":{"token":"...","isThinking":false,...}}}
+  const result = object.result as Record<string, unknown> | undefined;
+  if (result) {
+    const response = result.response as Record<string, unknown> | undefined;
+    if (response) {
+      const isThinking = response.isThinking;
+      const token = response.token;
+      if (isThinking !== true && typeof token === 'string') {
+        return token;
+      }
+    }
+
+    // Handle old format: {"result":{"token":"...","isThinking":false}}
+    const isThinking = result.isThinking;
+    const token = result.token;
+    if (isThinking !== true && typeof token === 'string') {
+      return token;
+    }
   }
 
+  // Handle direct token formats
   if (typeof object.token === 'string') {
     return object.token;
+  }
+
+  if (typeof object.text === 'string') {
+    return object.text;
   }
 
   return null;
@@ -720,11 +763,17 @@ function ingestGrokChunk(job: BridgeJob, chunk: string): void {
 
   job.parserBuffer = parsed.remainder;
 
+  let tokensEmitted = 0;
   for (const object of parsed.objects) {
     const token = tokenFromGrokObject(object);
     if (token !== null) {
       emitToken(job, token);
+      tokensEmitted++;
     }
+  }
+
+  if (tokensEmitted === 0 && parsed.objects.length > 0) {
+    console.log(`[proxy] ingestGrokChunk: ${parsed.objects.length} objects but no tokens extracted. First object:`, JSON.stringify(parsed.objects[0]).slice(0, 200));
   }
 }
 
@@ -912,6 +961,7 @@ async function handleHeartbeat(req: http.IncomingMessage, res: http.ServerRespon
     ok: true,
     bridge: bridgeStatus(),
     templateOverride,
+    newTemplateOverride,
   });
 }
 
@@ -922,7 +972,12 @@ async function handleBridgeTemplate(req: http.IncomingMessage, res: http.ServerR
     return;
   }
 
-  templateOverride = normalizeBridgeTemplate(template);
+  const normalized = normalizeBridgeTemplate(template);
+  if (conversationIdFromResponseUrl(normalized.url as string) === 'new') {
+    newTemplateOverride = normalized;
+  } else {
+    templateOverride = normalized;
+  }
 
   sendJson(res, 200, { ok: true });
 }
@@ -935,13 +990,15 @@ async function handlePollJob(res: http.ServerResponse): Promise<void> {
     return;
   }
 
+  const template = job.isNewConversation ? newTemplateOverride : templateOverride;
+
   sendJson(res, 200, {
     id: job.id,
     createdAt: job.createdAt,
     model: job.model,
     prompt: job.prompt,
     messages: job.request.messages ?? [],
-    requestTemplate: templateOverride,
+    requestTemplate: template,
   });
 }
 
