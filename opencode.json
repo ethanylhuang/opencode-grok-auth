@@ -1,0 +1,18 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "grok": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Grok Browser Bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:11434/v1",
+        "apiKey": "opencode-grok-auth"
+      },
+      "models": {
+        "grok-latest": {
+          "name": "Grok Latest (browser bridge)"
+        }
+      }
+    }
+  }
+}

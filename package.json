@@ -1,0 +1,31 @@
+{
+  "name": "opencode-grok-auth",
+  "version": "1.0.0",
+  "description": "",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test-endpoint": "tsx scripts/test-grok-endpoint.ts",
+    "proxy": "npm run build && node dist/proxy.js",
+    "proxy:dev": "tsx src/proxy.ts",
+    "test-bridge": "tsx scripts/test-bridge-flow.ts",
+    "test-proxy-client": "tsx scripts/test-proxy-client.ts",
+    "refresh-cookie": "tsx scripts/refresh-cookie.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.14.33",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "impit": "^0.13.1",
+    "puppeteer": "^24.42.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

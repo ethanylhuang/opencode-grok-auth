@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "OpenCode Grok Auth Bridge",
+  "version": "0.1.1",
+  "description": "Local-only bridge between OpenCode and an authenticated grok.com browser session.",
+  "permissions": ["storage", "tabs", "scripting"],
+  "host_permissions": [
+    "https://grok.com/*",
+    "http://127.0.0.1:11434/*",
+    "http://localhost:11434/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://grok.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://grok.com/*"]
+    }
+  ]
+}

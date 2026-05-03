@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grok Proxy Tester</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen p-4">
+    <main class="mx-auto flex w-full max-w-5xl flex-col gap-4">
+        <header class="flex flex-wrap items-end justify-between gap-3">
+            <div>
+                <h1 class="text-xl font-semibold text-zinc-100">Grok Bridge Tester</h1>
+                <p class="text-xs text-zinc-500">Proxy: http://127.0.0.1:11434</p>
+            </div>
+            <div id="status" class="text-xs text-zinc-500">Ready</div>
+        </header>
+
+        <section class="rounded border border-zinc-800 bg-zinc-900">
+            <div class="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 px-4 py-3">
+                <div>
+                    <h2 class="text-sm font-medium text-zinc-200">Bridge Health</h2>
+                    <div id="healthSummary" class="mt-1 text-xs text-zinc-500">Checking proxy...</div>
+                </div>
+                <button id="refreshHealthBtn" type="button"
+                        class="rounded border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800">
+                    Refresh
+                </button>
+            </div>
+            <div id="healthGrid" class="grid gap-px bg-zinc-800 text-xs sm:grid-cols-3 lg:grid-cols-6"></div>
+            <div id="healthDetail" class="border-t border-zinc-800 px-4 py-2 font-mono text-[11px] text-zinc-500"></div>
+        </section>
+
+        <section class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+            <div id="output" class="min-h-[360px] w-full overflow-auto rounded border border-zinc-800 bg-zinc-900 p-4 font-mono text-sm leading-6 whitespace-pre-wrap"></div>
+
+            <aside class="rounded border border-zinc-800 bg-zinc-900">
+                <div class="border-b border-zinc-800 px-4 py-3">
+                    <h2 class="text-sm font-medium text-zinc-200">Timing</h2>
+                    <div id="summary" class="mt-1 text-xs text-zinc-500">No request yet</div>
+                </div>
+                <div id="timings" class="divide-y divide-zinc-800 text-xs"></div>
+            </aside>
+        </section>
+
+        <form id="promptForm" class="flex gap-2">
+            <input type="text" id="prompt"
+                   class="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                   placeholder="Enter prompt..."
+                   autocomplete="off">
+            <button id="sendBtn" type="submit"
+                    class="rounded bg-sky-600 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400">
+                Send
+            </button>
+        </form>
+    </main>
+
+    <script>
+        const PROXY_URL = 'http://127.0.0.1:11434';
+        const timingRows = [
+            ['requestStartedAt', 'Client request started', 'client'],
+            ['requestReceivedAt', 'Proxy request received', 'server'],
+            ['jobQueuedAt', 'Job queued', 'server'],
+            ['streamHeadersFlushedAt', 'SSE headers flushed', 'server'],
+            ['jobAssignedAt', 'Job assigned', 'server'],
+            ['contentScriptAcceptedAt', 'Content script accepted', 'server'],
+            ['grokFetchStartedAt', 'Grok fetch started', 'server'],
+            ['grokResponseHeadersAt', 'Grok response headers', 'server'],
+            ['firstRawUpstreamChunkAt', 'First raw upstream chunk', 'server'],
+            ['firstParsedNonThinkingTokenAt', 'First parsed visible token', 'server'],
+            ['firstSseChunkReceivedAt', 'First SSE chunk received', 'client'],
+            ['firstVisibleTokenAt', 'First visible token rendered', 'client'],
+            ['doneAt', 'Stream completed', 'client'],
+        ];
+
+        const form = document.getElementById('promptForm');
+        const promptInput = document.getElementById('prompt');
+        const outputDiv = document.getElementById('output');
+        const sendBtn = document.getElementById('sendBtn');
+        const statusDiv = document.getElementById('status');
+        const timingsDiv = document.getElementById('timings');
+        const summaryDiv = document.getElementById('summary');
+        const healthSummaryDiv = document.getElementById('healthSummary');
+        const healthGridDiv = document.getElementById('healthGrid');
+        const healthDetailDiv = document.getElementById('healthDetail');
+        const refreshHealthBtn = document.getElementById('refreshHealthBtn');
+
+        let clientMarks = {};
+        let serverMarks = {};
+        let lastHealth = null;
+
+        form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            void send();
+        });
+        refreshHealthBtn.addEventListener('click', () => {
+            void refreshHealth();
+        });
+
+        renderTimings();
+        renderHealth(null);
+        void refreshHealth();
+        setInterval(() => {
+            void refreshHealth();
+        }, 2000);
+
+        async function send() {
+            const prompt = promptInput.value.trim();
+            if (!prompt) {
+                return;
+            }
+
+            outputDiv.innerText = '';
+            promptInput.value = '';
+            sendBtn.disabled = true;
+            sendBtn.innerText = '...';
+            statusDiv.innerText = 'Streaming';
+            clientMarks = {};
+            serverMarks = {};
+            markClient('requestStartedAt');
+
+            try {
+                const response = await fetch(`${PROXY_URL}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Grok-Debug-Timing': '1',
+                    },
+                    body: JSON.stringify({
+                        model: 'grok-latest',
+                        messages: [{ role: 'user', content: prompt }],
+                        stream: true,
+                    }),
+                });
+                markClient('responseHeadersReceivedAt');
+
+                const jobId = response.headers.get('X-Grok-Job-Id');
+                if (jobId) {
+                    statusDiv.innerText = `Streaming ${jobId.slice(0, 8)}`;
+                }
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+
+                    markClient('firstSseChunkReceivedAt');
+                    buffer += decoder.decode(value, { stream: true });
+                    buffer = processSseBuffer(buffer);
+                }
+
+                buffer += decoder.decode();
+                processSseBuffer(buffer, true);
+                markClient('doneAt');
+                statusDiv.innerText = 'Done';
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                outputDiv.innerText = `Error: ${message}`;
+                statusDiv.innerText = 'Error';
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.innerText = 'Send';
+                renderTimings();
+                void refreshHealth();
+            }
+        }
+
+        async function refreshHealth() {
+            try {
+                const response = await fetch(`${PROXY_URL}/health`, { cache: 'no-store' });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                lastHealth = await response.json();
+                renderHealth(lastHealth);
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                lastHealth = null;
+                renderHealth(null, message);
+            }
+        }
+
+        function renderHealth(health, errorMessage = '') {
+            const bridge = health?.bridge || {};
+            const jobs = health?.jobs || {};
+            const metrics = health?.metrics || {};
+            const ready = bridge.connected === true && bridge.activeGrokTab === true && bridge.hasRequestTemplate === true;
+
+            if (errorMessage) {
+                healthSummaryDiv.innerText = `Proxy unavailable: ${errorMessage}`;
+                healthSummaryDiv.className = 'mt-1 text-xs text-red-400';
+            } else if (ready) {
+                healthSummaryDiv.innerText = 'Ready: extension connected, Grok tab active, request template captured';
+                healthSummaryDiv.className = 'mt-1 text-xs text-emerald-400';
+            } else if (health) {
+                const missing = [];
+                if (bridge.connected !== true) missing.push('extension heartbeat');
+                if (bridge.activeGrokTab !== true) missing.push('active Grok tab');
+                if (bridge.hasRequestTemplate !== true) missing.push('request template');
+                healthSummaryDiv.innerText = `Not ready: missing ${missing.join(', ') || 'unknown bridge state'}`;
+                healthSummaryDiv.className = 'mt-1 text-xs text-amber-400';
+            } else {
+                healthSummaryDiv.innerText = 'Checking proxy...';
+                healthSummaryDiv.className = 'mt-1 text-xs text-zinc-500';
+            }
+
+            healthGridDiv.innerHTML = [
+                healthCell('Proxy', errorMessage ? 'down' : health ? 'up' : '-', !errorMessage && Boolean(health)),
+                healthCell('Extension', boolText(bridge.connected), bridge.connected === true),
+                healthCell('Grok Tab', boolText(bridge.activeGrokTab), bridge.activeGrokTab === true),
+                healthCell('Template', boolText(bridge.hasRequestTemplate), bridge.hasRequestTemplate === true),
+                healthCell('Queued', valueText(jobs.queued), jobs.queued === 0),
+                healthCell('Failed', valueText(metrics.failedJobs), (metrics.failedJobs || 0) === 0),
+            ].join('');
+
+            const detail = [];
+            if (bridge.ageMs !== undefined && bridge.ageMs !== null) {
+                detail.push(`heartbeatAge=${bridge.ageMs}ms`);
+            }
+            if (bridge.workerId) {
+                detail.push(`worker=${bridge.workerId}`);
+            }
+            if (bridge.url) {
+                detail.push(`template=${bridge.url}`);
+            }
+            if (bridge.extensionHasRequestTemplate !== undefined) {
+                detail.push(`extensionTemplate=${boolText(bridge.extensionHasRequestTemplate)}`);
+            }
+            if (bridge.proxyHasTemplateOverride !== undefined) {
+                detail.push(`proxyTemplate=${boolText(bridge.proxyHasTemplateOverride)}`);
+            }
+            if (bridge.manifestVersion) {
+                detail.push(`manifest=${bridge.manifestVersion}`);
+            }
+            if (bridge.backgroundCodeVersion) {
+                detail.push(`background=${bridge.backgroundCodeVersion}`);
+            }
+            if (bridge.templateInstallSource) {
+                detail.push(`templateSource=${bridge.templateInstallSource}`);
+            }
+            if (bridge.templateInstallError) {
+                detail.push(`templateError=${bridge.templateInstallError}`);
+            }
+            if (health) {
+                detail.push(`activeJobs=${valueText(jobs.active)}`);
+                detail.push(`created=${valueText(metrics.createdJobs)}`);
+                detail.push(`completed=${valueText(metrics.completedJobs)}`);
+                detail.push(`rawChunks=${valueText(metrics.rawChunks)}`);
+                detail.push(`tokens=${valueText(metrics.emittedTokens)}`);
+            }
+            healthDetailDiv.innerText = detail.join('  ');
+        }
+
+        function healthCell(label, value, ok) {
+            const color = ok ? 'text-emerald-400' : value === '-' ? 'text-zinc-500' : 'text-amber-400';
+            return `
+                <div class="bg-zinc-900 px-4 py-3">
+                    <div class="text-[11px] uppercase tracking-normal text-zinc-500">${label}</div>
+                    <div class="mt-1 font-mono ${color}">${value}</div>
+                </div>`;
+        }
+
+        function boolText(value) {
+            if (value === true) return 'true';
+            if (value === false) return 'false';
+            return '-';
+        }
+
+        function valueText(value) {
+            return typeof value === 'number' ? String(value) : '-';
+        }
+
+        function processSseBuffer(buffer, flush = false) {
+            const parts = buffer.split(/\r?\n\r?\n/);
+            const remainder = flush ? '' : parts.pop() || '';
+
+            for (const part of parts) {
+                handleSseFrame(part);
+            }
+
+            if (flush && parts.length === 0 && buffer.trim()) {
+                handleSseFrame(buffer);
+            }
+
+            return remainder;
+        }
+
+        function handleSseFrame(frame) {
+            const lines = frame.split('\n').map((line) => line.replace(/\r$/, ''));
+            let eventName = 'message';
+            const dataLines = [];
+
+            for (const line of lines) {
+                if (line.startsWith('event:')) {
+                    eventName = line.slice(6).trim();
+                    continue;
+                }
+                if (line.startsWith('data:')) {
+                    dataLines.push(line.slice(5).trimStart());
+                }
+            }
+
+            if (dataLines.length === 0) {
+                return;
+            }
+
+            const data = dataLines.join('\n');
+            if (eventName === 'grok-timing') {
+                mergeServerTiming(JSON.parse(data));
+                return;
+            }
+
+            if (eventName === 'error') {
+                const payload = JSON.parse(data);
+                throw new Error(payload.error?.message || data);
+            }
+
+            if (data === '[DONE]') {
+                return;
+            }
+
+            const json = JSON.parse(data);
+            const content = json.choices?.[0]?.delta?.content || '';
+            if (content) {
+                markClient('firstVisibleTokenAt');
+                outputDiv.innerText += content;
+            }
+        }
+
+        function mergeServerTiming(snapshot) {
+            const timings = snapshot && snapshot.timings && typeof snapshot.timings === 'object' ? snapshot.timings : {};
+            for (const [name, value] of Object.entries(timings)) {
+                if (value && typeof value.at === 'number' && serverMarks[name] === undefined) {
+                    serverMarks[name] = value.at;
+                }
+            }
+            renderTimings();
+        }
+
+        function markClient(name) {
+            if (clientMarks[name] === undefined) {
+                clientMarks[name] = Date.now();
+                renderTimings();
+            }
+        }
+
+        function renderTimings() {
+            const start = clientMarks.requestStartedAt;
+            let previousAt = null;
+            let visibleTokenMs = null;
+            let upstreamMs = null;
+
+            const rows = timingRows.map(([name, label, source]) => {
+                const at = source === 'client' ? clientMarks[name] : serverMarks[name];
+                const fromStart = start && at ? at - start : null;
+                const delta = at && previousAt ? at - previousAt : null;
+                if (at) {
+                    previousAt = at;
+                }
+                if (name === 'firstVisibleTokenAt') {
+                    visibleTokenMs = fromStart;
+                }
+                if (name === 'firstParsedNonThinkingTokenAt') {
+                    upstreamMs = fromStart;
+                }
+
+                return `
+                    <div class="grid grid-cols-[1fr_68px_68px] gap-2 px-4 py-2">
+                        <div class="truncate text-zinc-300" title="${label}">${label}</div>
+                        <div class="text-right font-mono ${fromStart === null ? 'text-zinc-600' : 'text-zinc-200'}">${formatMs(fromStart)}</div>
+                        <div class="text-right font-mono ${delta === null ? 'text-zinc-600' : 'text-zinc-400'}">${formatDelta(delta)}</div>
+                    </div>`;
+            }).join('');
+
+            timingsDiv.innerHTML = rows || '';
+            if (visibleTokenMs !== null) {
+                summaryDiv.innerText = `TTFT ${visibleTokenMs} ms${upstreamMs !== null ? `, bridge visible overhead ${visibleTokenMs - upstreamMs} ms` : ''}`;
+            } else if (start) {
+                summaryDiv.innerText = 'Waiting for first visible token';
+            } else {
+                summaryDiv.innerText = 'No request yet';
+            }
+        }
+
+        function formatMs(value) {
+            return value === null ? '-' : `${value} ms`;
+        }
+
+        function formatDelta(value) {
+            return value === null ? '-' : `+${value} ms`;
+        }
+    </script>
+</body>
+</html>
