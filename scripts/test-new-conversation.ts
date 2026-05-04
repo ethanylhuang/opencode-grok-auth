@@ -112,17 +112,49 @@ async function main() {
   });
 
   await postJson(`/bridge/jobs/${job.id}/chunks`, {
-    chunk:
-      '{"result":{"response":{"conversationId":"conv-new-123","responseId":"resp-new-1","token":"Hello","isThinking":false}}}',
+    chunk: JSON.stringify({
+      result: {
+        conversation: { id: 'conv-new-123' },
+        modelResponse: { id: 'resp-new-draft' },
+        response: { token: 'Hello', isThinking: false },
+      },
+    }),
     timings: { firstRawUpstreamChunkAt: acceptedAt + 3 },
   });
   await sleep(0);
   await postJson(`/bridge/jobs/${job.id}/chunks`, {
-    chunk: '{"result":{"token":" new","isThinking":false}}',
+    chunk: JSON.stringify({
+      result: {
+        response: {
+          conversation: { id: 'conv-new-123' },
+          modelResponse: { id: 'resp-new-mid' },
+          token: ' new',
+          isThinking: false,
+        },
+      },
+    }),
   });
   await sleep(0);
   await postJson(`/bridge/jobs/${job.id}/chunks`, {
-    chunk: '{"result":{"token":" world","isThinking":false}}',
+    chunk: JSON.stringify({
+      result: {
+        conversation_id: 'conv-new-123',
+        responseID: 'resp-new-case',
+        token: ' world',
+        isThinking: false,
+      },
+    }),
+  });
+  await sleep(0);
+  await postJson(`/bridge/jobs/${job.id}/chunks`, {
+    chunk: JSON.stringify({
+      result: {
+        finalMetadata: JSON.stringify({
+          conversationID: 'conv-new-123',
+          response_id: 'resp-new-1',
+        }),
+      },
+    }),
   });
   await sleep(0);
   await postJson(`/bridge/jobs/${job.id}/complete`, { ok: true });
@@ -182,7 +214,7 @@ async function main() {
 
   await postJson(`/bridge/jobs/${continueJob.id}/chunks`, {
     chunk:
-      '{"result":{"response":{"conversationId":"conv-new-123","responseId":"resp-new-2","token":"Continued","isThinking":false}}}',
+      '{"result":{"conversation":{"conversationId":"conv-new-123"},"response":{"modelResponse":{"responseId":"resp-new-2"},"token":"Continued","isThinking":false}}}',
   });
   await postJson(`/bridge/jobs/${continueJob.id}/complete`, { ok: true });
 

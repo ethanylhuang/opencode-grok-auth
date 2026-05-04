@@ -43,7 +43,7 @@
                 </div>
             </aside>
 
-            <div id="output" class="min-h-[360px] w-full overflow-auto rounded border border-zinc-800 bg-zinc-900 p-4 font-mono text-sm leading-6 whitespace-pre-wrap"></div>
+            <div id="output" class="min-h-[360px] w-full overflow-auto rounded border border-zinc-800 bg-zinc-900 p-4 font-mono text-sm leading-6"></div>
 
             <aside class="rounded border border-zinc-800 bg-zinc-900">
                 <div class="border-b border-zinc-800 px-4 py-3">
@@ -69,6 +69,7 @@
     <script>
         const PROXY_URL = 'http://127.0.0.1:11434';
         const STORAGE_KEY = 'grok-chat-sessions';
+        const MISSING_METADATA_WARNING = 'Warning: Grok returned a first response without continuation metadata. This chat cannot be continued; restart the proxy, create a new chat, and send the first prompt again.';
         const timingRows = [
             ['requestStartedAt', 'Client request started', 'client'],
             ['requestReceivedAt', 'Proxy request received', 'server'],
@@ -116,6 +117,7 @@
                     const parsed = JSON.parse(stored);
                     chatSessions = Array.isArray(parsed) ? parsed.map(normalizeChatSession).filter(Boolean) : [];
                     sortChatSessions();
+                    saveChatSessions();
                 }
             } catch {
                 chatSessions = [];
@@ -128,13 +130,28 @@
             }
 
             const now = Date.now();
+            const messages = Array.isArray(value.messages) ? value.messages.map(normalizeChatMessage).filter(Boolean) : [];
             return {
                 id: value.id,
                 title: typeof value.title === 'string' && value.title.trim() ? value.title : 'New Chat',
                 conversationId: typeof value.conversationId === 'string' && value.conversationId ? value.conversationId : null,
                 parentResponseId: typeof value.parentResponseId === 'string' && value.parentResponseId ? value.parentResponseId : null,
+                messages,
                 createdAt: typeof value.createdAt === 'number' ? value.createdAt : now,
                 updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : now,
+            };
+        }
+
+        function normalizeChatMessage(value) {
+            if (!value || typeof value !== 'object') {
+                return null;
+            }
+
+            const role = value.role === 'assistant' ? 'assistant' : 'user';
+            return {
+                role,
+                content: typeof value.content === 'string' ? value.content : String(value.content || ''),
+                createdAt: typeof value.createdAt === 'number' ? value.createdAt : Date.now(),
             };
         }
 
@@ -155,6 +172,7 @@
                 title: 'New Chat',
                 conversationId: null,
                 parentResponseId: null,
+                messages: [],
                 createdAt: Date.now(),
                 updatedAt: Date.now(),
             };
@@ -169,12 +187,12 @@
             const previousChatId = currentChatId;
             currentChatId = chatId;
             if (previousChatId !== chatId) {
-                outputDiv.innerText = '';
                 clientMarks = {};
                 serverMarks = {};
                 renderTimings();
                 summaryDiv.innerText = 'No request yet';
             }
+            renderTranscript();
             renderChatList();
         }
 
@@ -190,6 +208,64 @@
                 saveChatSessions();
                 renderChatList();
             }
+        }
+
+        function appendChatMessage(chatId, role, content) {
+            const chat = chatSessions.find(c => c.id === chatId);
+            if (!chat) {
+                return -1;
+            }
+
+            const messages = Array.isArray(chat.messages) ? chat.messages : [];
+            chat.messages = messages;
+            const index = messages.length;
+            messages.push({
+                role: role === 'assistant' ? 'assistant' : 'user',
+                content: String(content || ''),
+                createdAt: Date.now(),
+            });
+            chat.updatedAt = Date.now();
+            sortChatSessions();
+            saveChatSessions();
+            renderChatList();
+            if (currentChatId === chatId) {
+                renderTranscript();
+            }
+            return index;
+        }
+
+        function updateChatMessage(chatId, messageIndex, updater) {
+            const chat = chatSessions.find(c => c.id === chatId);
+            if (!chat || !Array.isArray(chat.messages) || !chat.messages[messageIndex]) {
+                return;
+            }
+
+            const message = chat.messages[messageIndex];
+            message.content = typeof updater === 'function' ? updater(message.content || '') : String(updater || '');
+            chat.updatedAt = Date.now();
+            saveChatSessions();
+            renderChatList();
+            if (currentChatId === chatId) {
+                renderTranscript();
+            }
+        }
+
+        function renderTranscript(chat = getCurrentChat()) {
+            if (!chat || !Array.isArray(chat.messages) || chat.messages.length === 0) {
+                outputDiv.innerHTML = '';
+                return;
+            }
+
+            outputDiv.innerHTML = chat.messages.map((message) => {
+                const label = message.role === 'assistant' ? 'Assistant' : 'User';
+                return `
+                    <div class="mb-4 last:mb-0">
+                        <div class="mb-1 text-[11px] uppercase tracking-normal text-zinc-500">${label}</div>
+                        <div class="text-zinc-100 whitespace-pre-wrap">${escapeHtml(message.content || '')}</div>
+                    </div>
+                `;
+            }).join('');
+            outputDiv.scrollTop = outputDiv.scrollHeight;
         }
 
         function generateTitle(prompt) {
@@ -281,31 +357,45 @@
             }
 
             const sentChatId = chat.id;
+            const hasMessages = Array.isArray(chat.messages) && chat.messages.length > 0;
+            const hasAnyContinuationMetadata = Boolean(chat.conversationId || chat.parentResponseId);
             const canContinueChat = Boolean(chat.conversationId && chat.parentResponseId);
-            const isNewChatSession = !canContinueChat;
+            const shouldCreateRemoteConversation = !hasMessages && !hasAnyContinuationMetadata;
 
             if (chat.title === 'New Chat') {
                 updateChat(sentChatId, { title: generateTitle(prompt) });
             }
 
-            outputDiv.innerText = '';
+            appendChatMessage(sentChatId, 'user', prompt);
             promptInput.value = '';
             sendBtn.disabled = true;
             sendBtn.innerText = '...';
-            statusDiv.innerText = 'Streaming';
             clientMarks = {};
             serverMarks = {};
+
+            if (!shouldCreateRemoteConversation && !canContinueChat) {
+                const message = 'Cannot continue this chat because it is missing Grok conversation metadata.';
+                appendChatMessage(sentChatId, 'assistant', `Error: ${message}`);
+                statusDiv.innerText = 'Error';
+                sendBtn.disabled = false;
+                sendBtn.innerText = 'Send';
+                renderTimings();
+                return;
+            }
+
+            const assistantMessageIndex = appendChatMessage(sentChatId, 'assistant', '');
+            statusDiv.innerText = 'Streaming';
             markClient('requestStartedAt');
 
             try {
-                const modelToUse = isNewChatSession ? 'grok-latest-new' : 'grok-latest';
+                const modelToUse = shouldCreateRemoteConversation ? 'grok-latest-new' : 'grok-latest';
                 const requestBody = {
                     model: modelToUse,
                     messages: [{ role: 'user', content: prompt }],
                     stream: true,
                 };
 
-                if (!isNewChatSession) {
+                if (!shouldCreateRemoteConversation) {
                     requestBody.conversationId = chat.conversationId;
                     requestBody.parentResponseId = chat.parentResponseId;
                 }
@@ -341,16 +431,26 @@
 
                     markClient('firstSseChunkReceivedAt');
                     buffer += decoder.decode(value, { stream: true });
-                    buffer = processSseBuffer(buffer, false, sentChatId);
+                    buffer = processSseBuffer(buffer, false, sentChatId, assistantMessageIndex);
                 }
 
                 buffer += decoder.decode();
-                processSseBuffer(buffer, true, sentChatId);
+                processSseBuffer(buffer, true, sentChatId, assistantMessageIndex);
                 markClient('doneAt');
-                statusDiv.innerText = 'Done';
+                const completedChat = chatSessions.find(c => c.id === sentChatId);
+                if (shouldCreateRemoteConversation && (!completedChat?.conversationId || !completedChat?.parentResponseId)) {
+                    updateChatMessage(sentChatId, assistantMessageIndex, (content) => {
+                        return content ? `${content}\n\n${MISSING_METADATA_WARNING}` : MISSING_METADATA_WARNING;
+                    });
+                    statusDiv.innerText = 'Warning';
+                } else {
+                    statusDiv.innerText = 'Done';
+                }
             } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
-                outputDiv.innerText = `Error: ${message}`;
+                updateChatMessage(sentChatId, assistantMessageIndex, (content) => {
+                    return content ? `${content}\n\nError: ${message}` : `Error: ${message}`;
+                });
                 statusDiv.innerText = 'Error';
             } finally {
                 sendBtn.disabled = false;
@@ -466,22 +566,22 @@
             return typeof value === 'number' ? String(value) : '-';
         }
 
-        function processSseBuffer(buffer, flush = false, chatId = currentChatId) {
+        function processSseBuffer(buffer, flush = false, chatId = currentChatId, assistantMessageIndex = -1) {
             const parts = buffer.split(/\r?\n\r?\n/);
             const remainder = flush ? '' : parts.pop() || '';
 
             for (const part of parts) {
-                handleSseFrame(part, chatId);
+                handleSseFrame(part, chatId, assistantMessageIndex);
             }
 
             if (flush && parts.length === 0 && buffer.trim()) {
-                handleSseFrame(buffer, chatId);
+                handleSseFrame(buffer, chatId, assistantMessageIndex);
             }
 
             return remainder;
         }
 
-        function handleSseFrame(frame, chatId = currentChatId) {
+        function handleSseFrame(frame, chatId = currentChatId, assistantMessageIndex = -1) {
             const lines = frame.split('\n').map((line) => line.replace(/\r$/, ''));
             let eventName = 'message';
             const dataLines = [];
@@ -534,7 +634,7 @@
             const content = json.choices?.[0]?.delta?.content || '';
             if (content) {
                 markClient('firstVisibleTokenAt');
-                outputDiv.innerText += content;
+                updateChatMessage(chatId, assistantMessageIndex, (current) => `${current || ''}${content}`);
             }
         }
 

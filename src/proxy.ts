@@ -72,6 +72,7 @@ type BridgeJob = {
   id: string;
   createdAt: number;
   assignedAt: number | null;
+  workerId: string | null;
   state: JobState;
   request: OpenAIChatRequest;
   prompt: string;
@@ -99,6 +100,9 @@ type GrokResponseMetadata = {
   conversationId?: string;
   responseId?: string;
 };
+
+const CONVERSATION_ID_KEYS = ['conversationId', 'conversation_id', 'conversationID'] as const;
+const RESPONSE_ID_KEYS = ['responseId', 'response_id', 'responseID'] as const;
 
 const jobs = new Map<string, BridgeJob>();
 const queue: string[] = [];
@@ -490,6 +494,7 @@ function createJob(
     id: randomUUID(),
     createdAt: queuedAt,
     assignedAt: null,
+    workerId: lastHeartbeat.workerId || null,
     state: 'queued',
     request,
     prompt,
@@ -610,15 +615,20 @@ function cancelJob(job: BridgeJob): void {
   removeJob(job);
 }
 
-function dequeueJob(): BridgeJob | null {
+function dequeueJob(workerId = ''): BridgeJob | null {
   while (queue.length > 0) {
-    const id = queue.shift();
-    if (!id) {
-      continue;
+    const index = queue.findIndex((id) => {
+      const job = jobs.get(id);
+      return !job || job.state !== 'queued' || !workerId || !job.workerId || job.workerId === workerId;
+    });
+
+    if (index === -1) {
+      return null;
     }
 
-    const job = jobs.get(id);
-    if (job && job.state === 'queued') {
+    const [id] = queue.splice(index, 1);
+    const job = id ? jobs.get(id) : null;
+    if (job && job.state === 'queued' && (!workerId || !job.workerId || job.workerId === workerId)) {
       job.state = 'assigned';
       job.assignedAt = Date.now();
       markTiming(job, 'jobAssignedAt', job.assignedAt);
@@ -637,8 +647,8 @@ function notifyWaiters(): void {
   }
 }
 
-function waitForJob(): Promise<BridgeJob | null> {
-  const available = dequeueJob();
+function waitForJob(workerId = ''): Promise<BridgeJob | null> {
+  const available = dequeueJob(workerId);
   if (available) {
     return Promise.resolve(available);
   }
@@ -659,7 +669,7 @@ function waitForJob(): Promise<BridgeJob | null> {
       }
       settled = true;
       clearTimeout(timer);
-      resolve(dequeueJob());
+      resolve(dequeueJob(workerId));
     });
   });
 }
@@ -762,47 +772,203 @@ function tokenFromGrokObject(value: unknown): string | null {
   return null;
 }
 
-function metadataFromGrokObject(value: unknown): GrokResponseMetadata {
-  if (!value || typeof value !== 'object') {
-    return {};
+function recordFrom(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function stringField(object: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = object[key];
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
   }
 
-  const object = value as Record<string, unknown>;
+  return undefined;
+}
+
+function parsedJsonMetadataString(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+function metadataFromExplicitPaths(object: Record<string, unknown>): GrokResponseMetadata {
   const metadata: GrokResponseMetadata = {};
 
   // Handle /new format: {"result":{"response":{"conversationId":"...","responseId":"..."}}}
-  const result = object.result as Record<string, unknown> | undefined;
+  const result = recordFrom(object.result);
   if (result) {
-    if (typeof result.conversationId === 'string') {
-      metadata.conversationId = result.conversationId;
+    const resultConversationId = stringField(result, CONVERSATION_ID_KEYS);
+    if (resultConversationId) {
+      metadata.conversationId = resultConversationId;
     }
-    if (typeof result.responseId === 'string') {
-      metadata.responseId = result.responseId;
+    const resultResponseId = stringField(result, RESPONSE_ID_KEYS);
+    if (resultResponseId) {
+      metadata.responseId = resultResponseId;
     }
-    const response = result.response as Record<string, unknown> | undefined;
+
+    const resultConversation = recordFrom(result.conversation);
+    if (!metadata.conversationId && resultConversation) {
+      const conversationId = stringField(resultConversation, CONVERSATION_ID_KEYS);
+      if (conversationId) {
+        metadata.conversationId = conversationId;
+      }
+    }
+
+    const resultModelResponse = recordFrom(result.modelResponse);
+    if (resultModelResponse) {
+      const responseId = stringField(resultModelResponse, RESPONSE_ID_KEYS);
+      if (responseId) {
+        metadata.responseId = responseId;
+      }
+    }
+
+    const response = recordFrom(result.response);
     if (response) {
-      if (typeof response.conversationId === 'string') {
-        metadata.conversationId = response.conversationId;
+      const responseConversationId = stringField(response, CONVERSATION_ID_KEYS);
+      if (responseConversationId) {
+        metadata.conversationId = responseConversationId;
       }
-      if (typeof response.responseId === 'string') {
-        metadata.responseId = response.responseId;
+      const responseResponseId = stringField(response, RESPONSE_ID_KEYS);
+      if (responseResponseId) {
+        metadata.responseId = responseResponseId;
       }
-      const conversation = response.conversation as Record<string, unknown> | undefined;
-      if (!metadata.conversationId && conversation && typeof conversation.conversationId === 'string') {
-        metadata.conversationId = conversation.conversationId;
+
+      const conversation = recordFrom(response.conversation);
+      if (!metadata.conversationId && conversation) {
+        const conversationId = stringField(conversation, CONVERSATION_ID_KEYS);
+        if (conversationId) {
+          metadata.conversationId = conversationId;
+        }
       }
-      if (!metadata.conversationId && conversation && typeof conversation.id === 'string') {
-        metadata.conversationId = conversation.id;
+
+      const modelResponse = recordFrom(response.modelResponse);
+      if (modelResponse) {
+        const responseId = stringField(modelResponse, RESPONSE_ID_KEYS);
+        if (responseId) {
+          metadata.responseId = responseId;
+        }
       }
     }
   }
 
   // Handle direct metadata formats
-  if (!metadata.conversationId && typeof object.conversationId === 'string') {
-    metadata.conversationId = object.conversationId;
+  if (!metadata.conversationId) {
+    const conversationId = stringField(object, CONVERSATION_ID_KEYS);
+    if (conversationId) {
+      metadata.conversationId = conversationId;
+    }
   }
-  if (typeof object.responseId === 'string') {
-    metadata.responseId = object.responseId;
+  const responseId = stringField(object, RESPONSE_ID_KEYS);
+  if (responseId) {
+    metadata.responseId = responseId;
+  }
+
+  return metadata;
+}
+
+function metadataFromFallbackValue(
+  value: unknown,
+  containerKey = '',
+  seen: WeakSet<object> = new WeakSet(),
+): GrokResponseMetadata {
+  if (typeof value === 'string') {
+    const parsed = parsedJsonMetadataString(value);
+    return parsed === undefined ? {} : metadataFromFallbackValue(parsed, containerKey, seen);
+  }
+
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+
+  if (seen.has(value)) {
+    return {};
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    const metadata: GrokResponseMetadata = {};
+    for (const item of value) {
+      const itemMetadata = metadataFromFallbackValue(item, containerKey, seen);
+      if (!metadata.conversationId && itemMetadata.conversationId) {
+        metadata.conversationId = itemMetadata.conversationId;
+      }
+      if (!metadata.responseId && itemMetadata.responseId) {
+        metadata.responseId = itemMetadata.responseId;
+      }
+      if (metadata.conversationId && metadata.responseId) {
+        break;
+      }
+    }
+    return metadata;
+  }
+
+  const object = value as Record<string, unknown>;
+  const normalizedContainerKey = containerKey.toLowerCase();
+  const metadata: GrokResponseMetadata = {};
+
+  const conversationId = stringField(object, CONVERSATION_ID_KEYS);
+  if (conversationId) {
+    metadata.conversationId = conversationId;
+  } else if (normalizedContainerKey === 'conversation' && typeof object.id === 'string' && object.id.length > 0) {
+    metadata.conversationId = object.id;
+  }
+
+  const responseId = stringField(object, RESPONSE_ID_KEYS);
+  if (responseId) {
+    metadata.responseId = responseId;
+  } else if (
+    (normalizedContainerKey === 'modelresponse' ||
+      normalizedContainerKey === 'response' ||
+      normalizedContainerKey === 'message') &&
+    typeof object.id === 'string' &&
+    object.id.length > 0
+  ) {
+    metadata.responseId = object.id;
+  }
+
+  for (const [key, child] of Object.entries(object)) {
+    if (metadata.conversationId && metadata.responseId) {
+      break;
+    }
+
+    const childMetadata = metadataFromFallbackValue(child, key, seen);
+    if (!metadata.conversationId && childMetadata.conversationId) {
+      metadata.conversationId = childMetadata.conversationId;
+    }
+    if (!metadata.responseId && childMetadata.responseId) {
+      metadata.responseId = childMetadata.responseId;
+    }
+  }
+
+  return metadata;
+}
+
+function metadataFromGrokObject(value: unknown): GrokResponseMetadata {
+  const object = recordFrom(value);
+  if (!object) {
+    return {};
+  }
+
+  const explicit = metadataFromExplicitPaths(object);
+  const fallback = metadataFromFallbackValue(object);
+  const metadata: GrokResponseMetadata = {};
+
+  const conversationId = explicit.conversationId ?? fallback.conversationId;
+  if (conversationId) {
+    metadata.conversationId = conversationId;
+  }
+  const responseId = explicit.responseId ?? fallback.responseId;
+  if (responseId) {
+    metadata.responseId = responseId;
   }
 
   return metadata;
@@ -838,11 +1004,11 @@ function ingestGrokChunk(job: BridgeJob, chunk: string): void {
     const metadata = metadataFromGrokObject(object);
     const metadataUpdate: GrokResponseMetadata = {};
 
-    if (job.conversationId === null && metadata.conversationId) {
+    if (metadata.conversationId && job.conversationId !== metadata.conversationId) {
       job.conversationId = metadata.conversationId;
       metadataUpdate.conversationId = metadata.conversationId;
     }
-    if (job.responseId === null && metadata.responseId) {
+    if (metadata.responseId && job.responseId !== metadata.responseId) {
       job.responseId = metadata.responseId;
       metadataUpdate.responseId = metadata.responseId;
     }
@@ -1083,8 +1249,9 @@ async function handleBridgeTemplate(req: http.IncomingMessage, res: http.ServerR
   sendJson(res, 200, { ok: true });
 }
 
-async function handlePollJob(res: http.ServerResponse): Promise<void> {
-  const job = await waitForJob();
+async function handlePollJob(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
+  const workerId = url.searchParams.get('workerId') || '';
+  const job = await waitForJob(workerId);
   if (!job) {
     res.writeHead(204);
     res.end();
@@ -1222,7 +1389,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
   }
 
   if (req.method === 'GET' && path === '/bridge/jobs') {
-    await handlePollJob(res);
+    await handlePollJob(req, res, url);
     return;
   }
 

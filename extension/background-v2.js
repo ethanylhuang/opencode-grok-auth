@@ -120,13 +120,29 @@ function sendTabMessage(tabId, message) {
   });
 }
 
+function updateTab(tabId, updateProperties) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.update(tabId, updateProperties, (tab) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      resolve(tab);
+    });
+  });
+}
+
 async function findGrokTab() {
-  const tabs = await queryTabs({ url: 'https://grok.com/*' });
-  if (tabs.length === 0) {
+  const tabs = await queryTabs({});
+  const grokTabs = tabs.filter((tab) => {
+    return typeof tab.url === 'string' && (tab.url === 'https://grok.com' || tab.url.startsWith('https://grok.com/'));
+  });
+  if (grokTabs.length === 0) {
     return null;
   }
 
-  return tabs.find((tab) => tab.active) || tabs[0];
+  return grokTabs.find((tab) => tab.active) || grokTabs[0];
 }
 
 function rememberObservedRequest(detail) {
@@ -381,6 +397,10 @@ async function runJobInGrokTab(job) {
     return;
   }
 
+  if (job.conversationId) {
+    await focusContinuationTab(tab.id, job.conversationId);
+  }
+
   try {
     await ensureContentScript(tab.id);
   } catch (error) {
@@ -408,6 +428,36 @@ async function runJobInGrokTab(job) {
   }
 
   await completion;
+}
+
+async function focusContinuationTab(tabId, conversationId) {
+  const targetUrl = `https://grok.com/c/${encodeURIComponent(conversationId)}`;
+  const loaded = waitForTabUrl(tabId, targetUrl);
+  await updateTab(tabId, { active: true, url: targetUrl });
+  await loaded;
+}
+
+function waitForTabUrl(tabId, targetUrl) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(done, 10000);
+
+    function done() {
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }
+
+    function listener(updatedTabId, changeInfo, tab) {
+      if (updatedTabId !== tabId) {
+        return;
+      }
+      if (tab.url && tab.url.startsWith(targetUrl) && changeInfo.status === 'complete') {
+        done();
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
 }
 
 function waitForActiveJob(jobId) {

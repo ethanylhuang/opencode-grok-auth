@@ -2,7 +2,7 @@
   const PAGE_SOURCE = 'opencode-grok-auth-page';
   const EXTENSION_SOURCE = 'opencode-grok-auth-extension';
   const VERSION_KEY = '__opencodeGrokAuthBridgeVersion';
-  const VERSION = '9';
+  const VERSION = '10';
   const ORIGINAL_FETCH_KEY = '__opencodeGrokAuthOriginalFetch';
   const BRIDGE_REPLAY_MARKER = '__opencodeGrokBridgeReplay';
   const UI_FALLBACK_STORAGE_KEY = 'opencodeGrokAuthAllowUiFallback';
@@ -139,7 +139,7 @@
 
       if (!response.ok) {
         const body = await response.text().catch(() => '');
-        if (response.status === 403 && isUiFallbackEnabled()) {
+        if (response.status === 403 && shouldUseUiFallback(job)) {
           await runGrokJobThroughUi(runId, job);
           return;
         }
@@ -491,6 +491,13 @@
     } catch {
       return false;
     }
+  }
+
+  function shouldUseUiFallback(job) {
+    if (isUiFallbackEnabled()) {
+      return true;
+    }
+    return Boolean(job?.conversationId && job?.parentResponseId);
   }
 
   function randomId() {
