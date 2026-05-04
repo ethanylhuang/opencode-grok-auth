@@ -10,6 +10,7 @@ const HOST = process.env.GROK_PROXY_HOST ?? '127.0.0.1';
 const EXTENSION_TTL_MS = Number(process.env.GROK_EXTENSION_TTL_MS ?? 60_000);
 const JOB_TIMEOUT_MS = Number(process.env.GROK_JOB_TIMEOUT_MS ?? 120_000);
 const LONG_POLL_MS = Number(process.env.GROK_LONG_POLL_MS ?? 25_000);
+const FAST_PATH_ENABLED = process.env.GROK_FAST_PATH_ENABLED !== '0';
 const MAX_BODY_BYTES = Number(process.env.GROK_MAX_BODY_BYTES ?? 1_000_000);
 const CHROME_PROFILE_DIR =
   process.env.GROK_CHROME_PROFILE_DIR ??
@@ -62,6 +63,7 @@ const TIMING_NAMES = [
   'grokResponseHeadersAt',
   'firstRawUpstreamChunkAt',
   'firstParsedNonThinkingTokenAt',
+  'firstSseChunkAt',
 ] as const;
 type TimingName = (typeof TIMING_NAMES)[number];
 type TimingMap = Partial<Record<TimingName, number>>;
@@ -1222,6 +1224,10 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
   }
 
   if (req.method === 'GET' && path === '/bridge/jobs') {
+    if (FAST_PATH_ENABLED && req.headers.accept && req.headers.accept.includes('text/event-stream')) {
+      await handleJobStream(req, res);
+      return;
+    }
     await handlePollJob(res);
     return;
   }
@@ -1277,3 +1283,57 @@ if (require.main === module) {
     server.close(() => process.exit(0));
   });
 }
+async function handleJobStream(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const url = new URL(req.url || '/bridge/jobs', `http://${HOST}:${PORT}`);
+  const workerId = url.searchParams.get('workerId')?.trim();
+
+  if (!workerId) {
+    sendError(res, 400, 'Missing workerId query parameter');
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  const send = () => {
+    const job = dequeueJob();
+    if (!job) {
+      return;
+    }
+    const template = job.isNewConversation
+      ? newTemplateOverride
+      : job.conversationId
+        ? templateOverride ?? newTemplateOverride
+        : templateOverride;
+    res.write(`event: job\ndata: ${JSON.stringify({
+      id: job.id,
+      createdAt: job.createdAt,
+      model: job.model,
+      prompt: job.prompt,
+      conversationId: job.conversationId,
+      parentResponseId: job.parentResponseId,
+      responseId: job.responseId,
+      messages: job.request.messages ?? [],
+      requestTemplate: template,
+    })}\n\n`);
+  };
+
+  const waiter = () => send();
+  waiters.push(waiter);
+  send();
+  const interval = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(': keepalive\n\n');
+      send();
+    }
+  }, 5000);
+
+  req.on('close', () => {
+    clearInterval(interval);
+    const idx = waiters.indexOf(waiter);
+    if (idx >= 0) waiters.splice(idx, 1);
+  });
+}
+

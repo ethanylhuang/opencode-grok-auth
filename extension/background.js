@@ -1,6 +1,6 @@
 const BRIDGE_ORIGIN = 'http://127.0.0.1:11434';
 const WORKER_ID = getWorkerId();
-const BACKGROUND_CODE_VERSION = 'chat-session-routing-v1';
+const BACKGROUND_CODE_VERSION = 'm4-ttft-fastpath-v1';
 const POLL_BACKOFF_MS = 1000;
 const JOB_RUN_TIMEOUT_MS = 180000;
 
@@ -9,6 +9,7 @@ let lastObservedNewRequest = null;
 let lastTemplateInstallSource = '';
 let lastTemplateInstallError = '';
 let polling = false;
+let pushStreamAbort = null;
 const activeJobs = new Map();
 const jobPostChains = new Map();
 
@@ -27,11 +28,11 @@ chrome.storage.local.get(['lastObservedRequest', 'lastObservedNewRequest'], (res
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  startPolling();
+  startPushJobStream();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  startPolling();
+  startPushJobStream();
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
@@ -88,7 +89,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   return false;
 });
 
-startPolling();
+startPushJobStream();
 
 function getWorkerId() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
@@ -297,6 +298,56 @@ async function postHeartbeat() {
         installObservedRequest(body.newTemplateOverride, 'proxy-new-template-override');
       }
     }
+  }
+}
+
+
+async function startPushJobStream() {
+  if (pushStreamAbort) {
+    return;
+  }
+
+  const controller = new AbortController();
+  pushStreamAbort = controller;
+
+  try {
+    const response = await bridgeFetch(`/bridge/jobs?workerId=${encodeURIComponent(WORKER_ID)}`, {
+      headers: { Accept: 'text/event-stream' },
+      signal: controller.signal,
+    });
+
+    if (!response.ok || !response.body || !(response.headers.get('content-type') || '').includes('text/event-stream')) {
+      throw new Error(`Push stream unavailable: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const line = frame.split('\n').find((l) => l.startsWith('data: '));
+        if (!line) continue;
+        const json = line.slice(6);
+        try {
+          const job = JSON.parse(json);
+          if (job && job.id) {
+            void runJob(job);
+          }
+        } catch {}
+      }
+    }
+  } catch (error) {
+    console.warn('[grok-bridge] push stream failed, fallback polling', errorMessage(error));
+  } finally {
+    pushStreamAbort = null;
+    startPolling();
   }
 }
 
