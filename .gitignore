@@ -1,5 +1,6 @@
 node_modules/
 .opencode/
+.tmp/
 *.log
 dist/
 scripts/*.js

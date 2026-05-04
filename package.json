@@ -7,10 +7,12 @@
   "scripts": {
     "build": "tsc",
     "test-endpoint": "tsx scripts/test-grok-endpoint.ts",
-    "test-new-conversation": "tsx scripts/test-new-conversation.ts",
+    "test-new-conversation": "node --import tsx scripts/test-new-conversation.ts",
     "proxy": "npm run build && node dist/proxy.js",
     "proxy:dev": "tsx src/proxy.ts",
     "test-bridge": "tsx scripts/test-bridge-flow.ts",
+    "test-chat-history-ui": "node --import tsx scripts/test-chat-history-ui.ts",
+    "test-extension-routing": "node --import tsx scripts/test-extension-routing.ts",
     "test-proxy-client": "tsx scripts/test-proxy-client.ts",
     "refresh-cookie": "tsx scripts/refresh-cookie.ts"
   },

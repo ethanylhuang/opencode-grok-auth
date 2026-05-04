@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-zinc-950 text-zinc-100 min-h-screen p-4">
-    <main class="mx-auto flex w-full max-w-5xl flex-col gap-4">
+    <main class="mx-auto flex w-full max-w-6xl flex-col gap-4">
         <header class="flex flex-wrap items-end justify-between gap-3">
             <div>
                 <h1 class="text-xl font-semibold text-zinc-100">Grok Bridge Tester</h1>
@@ -31,7 +31,18 @@
             <div id="healthDetail" class="border-t border-zinc-800 px-4 py-2 font-mono text-[11px] text-zinc-500"></div>
         </section>
 
-        <section class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <section class="grid gap-4 lg:grid-cols-[280px_1fr_360px]">
+            <aside id="chatSidebar" class="rounded border border-zinc-800 bg-zinc-900 flex flex-col">
+                <div class="border-b border-zinc-800 px-4 py-3">
+                    <button id="newChatBtn" type="button"
+                            class="w-full rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500">
+                        + New Chat
+                    </button>
+                </div>
+                <div id="chatList" class="flex-1 overflow-auto divide-y divide-zinc-800">
+                </div>
+            </aside>
+
             <div id="output" class="min-h-[360px] w-full overflow-auto rounded border border-zinc-800 bg-zinc-900 p-4 font-mono text-sm leading-6 whitespace-pre-wrap"></div>
 
             <aside class="rounded border border-zinc-800 bg-zinc-900">
@@ -48,10 +59,6 @@
                    class="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
                    placeholder="Enter prompt..."
                    autocomplete="off">
-            <label class="flex items-center gap-2 text-sm text-zinc-300">
-                <input type="checkbox" id="newConversation" class="rounded border-zinc-700 bg-zinc-900 text-sky-500 focus:ring-sky-500">
-                New Chat
-            </label>
             <button id="sendBtn" type="submit"
                     class="rounded bg-sky-600 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400">
                 Send
@@ -61,6 +68,7 @@
 
     <script>
         const PROXY_URL = 'http://127.0.0.1:11434';
+        const STORAGE_KEY = 'grok-chat-sessions';
         const timingRows = [
             ['requestStartedAt', 'Client request started', 'client'],
             ['requestReceivedAt', 'Proxy request received', 'server'],
@@ -79,7 +87,6 @@
 
         const form = document.getElementById('promptForm');
         const promptInput = document.getElementById('prompt');
-        const newConversationCheckbox = document.getElementById('newConversation');
         const outputDiv = document.getElementById('output');
         const sendBtn = document.getElementById('sendBtn');
         const statusDiv = document.getElementById('status');
@@ -89,10 +96,151 @@
         const healthGridDiv = document.getElementById('healthGrid');
         const healthDetailDiv = document.getElementById('healthDetail');
         const refreshHealthBtn = document.getElementById('refreshHealthBtn');
+        const newChatBtn = document.getElementById('newChatBtn');
+        const chatList = document.getElementById('chatList');
 
         let clientMarks = {};
         let serverMarks = {};
         let lastHealth = null;
+        let chatSessions = [];
+        let currentChatId = null;
+
+        function generateId() {
+            return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        }
+
+        function loadChatSessions() {
+            try {
+                const stored = localStorage.getItem(STORAGE_KEY);
+                if (stored) {
+                    const parsed = JSON.parse(stored);
+                    chatSessions = Array.isArray(parsed) ? parsed.map(normalizeChatSession).filter(Boolean) : [];
+                    sortChatSessions();
+                }
+            } catch {
+                chatSessions = [];
+            }
+        }
+
+        function normalizeChatSession(value) {
+            if (!value || typeof value !== 'object' || typeof value.id !== 'string') {
+                return null;
+            }
+
+            const now = Date.now();
+            return {
+                id: value.id,
+                title: typeof value.title === 'string' && value.title.trim() ? value.title : 'New Chat',
+                conversationId: typeof value.conversationId === 'string' && value.conversationId ? value.conversationId : null,
+                parentResponseId: typeof value.parentResponseId === 'string' && value.parentResponseId ? value.parentResponseId : null,
+                createdAt: typeof value.createdAt === 'number' ? value.createdAt : now,
+                updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : now,
+            };
+        }
+
+        function saveChatSessions() {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(chatSessions));
+            } catch {
+            }
+        }
+
+        function sortChatSessions() {
+            chatSessions.sort((left, right) => right.updatedAt - left.updatedAt);
+        }
+
+        function createNewChat() {
+            const chat = {
+                id: generateId(),
+                title: 'New Chat',
+                conversationId: null,
+                parentResponseId: null,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+            };
+            chatSessions.unshift(chat);
+            saveChatSessions();
+            selectChat(chat.id);
+            renderChatList();
+            return chat;
+        }
+
+        function selectChat(chatId) {
+            const previousChatId = currentChatId;
+            currentChatId = chatId;
+            if (previousChatId !== chatId) {
+                outputDiv.innerText = '';
+                clientMarks = {};
+                serverMarks = {};
+                renderTimings();
+                summaryDiv.innerText = 'No request yet';
+            }
+            renderChatList();
+        }
+
+        function getCurrentChat() {
+            return chatSessions.find(c => c.id === currentChatId) || null;
+        }
+
+        function updateChat(chatId, updates) {
+            const chat = chatSessions.find(c => c.id === chatId);
+            if (chat) {
+                Object.assign(chat, updates, { updatedAt: Date.now() });
+                sortChatSessions();
+                saveChatSessions();
+                renderChatList();
+            }
+        }
+
+        function generateTitle(prompt) {
+            const text = typeof prompt === 'string' ? prompt : String(prompt || '');
+            const truncated = text.slice(0, 30).trim();
+            return truncated || 'New Chat';
+        }
+
+        function renderChatList() {
+            if (chatSessions.length === 0) {
+                chatList.innerHTML = '<div class="px-4 py-3 text-xs text-zinc-500">No chats yet</div>';
+                return;
+            }
+
+            chatList.innerHTML = chatSessions.map(chat => {
+                const isActive = chat.id === currentChatId;
+                const title = chat.title || 'New Chat';
+                const time = formatTimeAgo(chat.updatedAt);
+
+                return `
+                    <button type="button" data-chat-id="${chat.id}"
+                            class="w-full text-left px-4 py-3 hover:bg-zinc-800 transition-colors ${isActive ? 'bg-zinc-800' : ''}">
+                        <div class="text-sm font-medium text-zinc-200 truncate">${escapeHtml(title)}</div>
+                        <div class="text-xs text-zinc-500 mt-0.5">${time}</div>
+                    </button>
+                `;
+            }).join('');
+
+            chatList.querySelectorAll('button[data-chat-id]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    selectChat(btn.dataset.chatId);
+                });
+            });
+        }
+
+        function formatTimeAgo(timestamp) {
+            const seconds = Math.floor((Date.now() - timestamp) / 1000);
+            if (seconds < 60) return 'just now';
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return `${minutes}m ago`;
+            const hours = Math.floor(minutes / 60);
+            if (hours < 24) return `${hours}h ago`;
+            const days = Math.floor(hours / 24);
+            return `${days}d ago`;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
 
         form.addEventListener('submit', (event) => {
             event.preventDefault();
@@ -101,7 +249,12 @@
         refreshHealthBtn.addEventListener('click', () => {
             void refreshHealth();
         });
+        newChatBtn.addEventListener('click', () => {
+            void createNewChat();
+            promptInput.focus();
+        });
 
+        loadChatSessions();
         renderTimings();
         renderHealth(null);
         void refreshHealth();
@@ -109,10 +262,30 @@
             void refreshHealth();
         }, 2000);
 
+        if (chatSessions.length > 0) {
+            selectChat(chatSessions[0].id);
+        } else {
+            createNewChat();
+        }
+        renderChatList();
+
         async function send() {
             const prompt = promptInput.value.trim();
             if (!prompt) {
                 return;
+            }
+
+            let chat = getCurrentChat();
+            if (!chat) {
+                chat = createNewChat();
+            }
+
+            const sentChatId = chat.id;
+            const canContinueChat = Boolean(chat.conversationId && chat.parentResponseId);
+            const isNewChatSession = !canContinueChat;
+
+            if (chat.title === 'New Chat') {
+                updateChat(sentChatId, { title: generateTitle(prompt) });
             }
 
             outputDiv.innerText = '';
@@ -125,18 +298,25 @@
             markClient('requestStartedAt');
 
             try {
-                const modelToUse = newConversationCheckbox.checked ? 'grok-latest-new' : 'grok-latest';
+                const modelToUse = isNewChatSession ? 'grok-latest-new' : 'grok-latest';
+                const requestBody = {
+                    model: modelToUse,
+                    messages: [{ role: 'user', content: prompt }],
+                    stream: true,
+                };
+
+                if (!isNewChatSession) {
+                    requestBody.conversationId = chat.conversationId;
+                    requestBody.parentResponseId = chat.parentResponseId;
+                }
+
                 const response = await fetch(`${PROXY_URL}/v1/chat/completions`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-Grok-Debug-Timing': '1',
                     },
-                    body: JSON.stringify({
-                        model: modelToUse,
-                        messages: [{ role: 'user', content: prompt }],
-                        stream: true,
-                    }),
+                    body: JSON.stringify(requestBody),
                 });
                 markClient('responseHeadersReceivedAt');
 
@@ -161,11 +341,11 @@
 
                     markClient('firstSseChunkReceivedAt');
                     buffer += decoder.decode(value, { stream: true });
-                    buffer = processSseBuffer(buffer);
+                    buffer = processSseBuffer(buffer, false, sentChatId);
                 }
 
                 buffer += decoder.decode();
-                processSseBuffer(buffer, true);
+                processSseBuffer(buffer, true, sentChatId);
                 markClient('doneAt');
                 statusDiv.innerText = 'Done';
             } catch (err) {
@@ -286,22 +466,22 @@
             return typeof value === 'number' ? String(value) : '-';
         }
 
-        function processSseBuffer(buffer, flush = false) {
+        function processSseBuffer(buffer, flush = false, chatId = currentChatId) {
             const parts = buffer.split(/\r?\n\r?\n/);
             const remainder = flush ? '' : parts.pop() || '';
 
             for (const part of parts) {
-                handleSseFrame(part);
+                handleSseFrame(part, chatId);
             }
 
             if (flush && parts.length === 0 && buffer.trim()) {
-                handleSseFrame(buffer);
+                handleSseFrame(buffer, chatId);
             }
 
             return remainder;
         }
 
-        function handleSseFrame(frame) {
+        function handleSseFrame(frame, chatId = currentChatId) {
             const lines = frame.split('\n').map((line) => line.replace(/\r$/, ''));
             let eventName = 'message';
             const dataLines = [];
@@ -323,6 +503,21 @@
             const data = dataLines.join('\n');
             if (eventName === 'grok-timing') {
                 mergeServerTiming(JSON.parse(data));
+                return;
+            }
+
+            if (eventName === 'grok-response-metadata') {
+                const metadata = JSON.parse(data);
+                const updates = {};
+                if (metadata.conversationId) {
+                    updates.conversationId = metadata.conversationId;
+                }
+                if (metadata.responseId) {
+                    updates.parentResponseId = metadata.responseId;
+                }
+                if (Object.keys(updates).length > 0) {
+                    updateChat(chatId, updates);
+                }
                 return;
             }
 

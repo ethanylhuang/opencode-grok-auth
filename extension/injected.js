@@ -2,7 +2,7 @@
   const PAGE_SOURCE = 'opencode-grok-auth-page';
   const EXTENSION_SOURCE = 'opencode-grok-auth-extension';
   const VERSION_KEY = '__opencodeGrokAuthBridgeVersion';
-  const VERSION = '8';
+  const VERSION = '9';
   const ORIGINAL_FETCH_KEY = '__opencodeGrokAuthOriginalFetch';
   const BRIDGE_REPLAY_MARKER = '__opencodeGrokBridgeReplay';
   const UI_FALLBACK_STORAGE_KEY = 'opencodeGrokAuthAllowUiFallback';
@@ -159,15 +159,16 @@
   }
 
   async function directGrokFetch(runId, job, requestTemplate, jobTimings) {
-    const payload = buildPayload(requestTemplate.body, job.prompt);
+    const payload = buildPayload(requestTemplate.body, job.prompt, job.parentResponseId);
+    const url = buildRequestUrl(requestTemplate.url, job.conversationId);
     const headers = buildHeaders(requestTemplate.headers);
 
     markPageTiming(runId, job.id, jobTimings, 'grokFetchStartedAt');
-    const response = await originalFetch(requestTemplate.url, {
+    const response = await originalFetch(url, {
       method: 'POST',
       credentials: 'include',
       headers,
-      referrer: requestTemplate.referer || location.href,
+      referrer: buildReferrer(requestTemplate.referer, job.conversationId),
       body: JSON.stringify(payload),
       [BRIDGE_REPLAY_MARKER]: true,
     });
@@ -177,7 +178,7 @@
       status: response.status,
       statusText: response.statusText,
       contentType: response.headers.get('content-type'),
-      url: requestTemplate.url,
+      url,
     });
 
     return response;
@@ -404,12 +405,40 @@
     return copy;
   }
 
-  function buildPayload(templateBody, prompt) {
+  function buildRequestUrl(templateUrl, conversationId) {
+    if (!conversationId || typeof conversationId !== 'string') {
+      return templateUrl;
+    }
+
+    try {
+      const parsed = new URL(templateUrl, location.origin);
+      if (/^\/rest\/app-chat\/conversations\/(new|[^/]+\/responses)$/.test(parsed.pathname)) {
+        parsed.pathname = `/rest/app-chat/conversations/${encodeURIComponent(conversationId)}/responses`;
+        return parsed.toString();
+      }
+    } catch {
+    }
+
+    return templateUrl;
+  }
+
+  function buildReferrer(templateReferer, conversationId) {
+    if (conversationId && typeof conversationId === 'string') {
+      return `${location.origin}/c/${encodeURIComponent(conversationId)}`;
+    }
+    return templateReferer || location.href;
+  }
+
+  function buildPayload(templateBody, prompt, parentResponseId) {
     const payload = clonePlainObject(templateBody);
     payload.message = prompt;
     payload.isRegenRequest = false;
     payload.skipCancelCurrentInflightRequests = false;
     payload.sendFinalMetadata = true;
+
+    if (parentResponseId) {
+      payload.parentResponseId = parentResponseId;
+    }
 
     if (!payload.metadata || typeof payload.metadata !== 'object') {
       payload.metadata = { request_metadata: {} };

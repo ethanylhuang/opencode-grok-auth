@@ -15,6 +15,7 @@ const CHROME_PROFILE_DIR =
   process.env.GROK_CHROME_PROFILE_DIR ??
   path.join(os.homedir(), 'Library/Application Support/Google/Chrome/Default');
 const CHROME_EXTENSION_ID = process.env.GROK_EXTENSION_ID ?? 'fodbpllijbgbjnhhimbojapinpdhfkae';
+const DISABLE_TEMPLATE_RECOVERY = process.env.GROK_DISABLE_TEMPLATE_RECOVERY === '1';
 const TEMPLATE_RECOVERY_INTERVAL_MS = 5_000;
 
 type ChatMessage = {
@@ -27,6 +28,8 @@ type OpenAIChatRequest = {
   model?: string;
   messages?: ChatMessage[];
   stream?: boolean;
+  conversationId?: string;
+  parentResponseId?: string;
 };
 
 type BridgeHeartbeat = {
@@ -74,6 +77,9 @@ type BridgeJob = {
   prompt: string;
   model: string;
   isNewConversation: boolean;
+  conversationId: string | null;
+  parentResponseId: string | null;
+  responseId: string | null;
   text: string;
   parserBuffer: string;
   error: string | null;
@@ -87,6 +93,11 @@ type ParsedObjects = {
   objects: unknown[];
   remainder: string;
   error: string | null;
+};
+
+type GrokResponseMetadata = {
+  conversationId?: string;
+  responseId?: string;
 };
 
 const jobs = new Map<string, BridgeJob>();
@@ -399,6 +410,10 @@ function recoverTemplatesFromChromeStorage(): { regular: BridgeTemplate | null; 
 }
 
 function ensureTemplateOverrideRecovered(): void {
+  if (DISABLE_TEMPLATE_RECOVERY) {
+    return;
+  }
+
   if ((templateOverride && newTemplateOverride) || Date.now() - lastTemplateRecoveryAt < TEMPLATE_RECOVERY_INTERVAL_MS) {
     return;
   }
@@ -465,6 +480,12 @@ function createJob(
 ): BridgeJob {
   const queuedAt = Date.now();
   const isNewConversation = request.model === 'grok-latest-new';
+  const conversationId =
+    typeof request.conversationId === 'string' && request.conversationId.length > 0 ? request.conversationId : null;
+  const parentResponseId =
+    typeof request.parentResponseId === 'string' && request.parentResponseId.length > 0
+      ? request.parentResponseId
+      : null;
   const job: BridgeJob = {
     id: randomUUID(),
     createdAt: queuedAt,
@@ -474,6 +495,9 @@ function createJob(
     prompt,
     model: request.model ?? 'grok-latest',
     isNewConversation,
+    conversationId,
+    parentResponseId,
+    responseId: null,
     text: '',
     parserBuffer: '',
     error: null,
@@ -738,6 +762,52 @@ function tokenFromGrokObject(value: unknown): string | null {
   return null;
 }
 
+function metadataFromGrokObject(value: unknown): GrokResponseMetadata {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+
+  const object = value as Record<string, unknown>;
+  const metadata: GrokResponseMetadata = {};
+
+  // Handle /new format: {"result":{"response":{"conversationId":"...","responseId":"..."}}}
+  const result = object.result as Record<string, unknown> | undefined;
+  if (result) {
+    if (typeof result.conversationId === 'string') {
+      metadata.conversationId = result.conversationId;
+    }
+    if (typeof result.responseId === 'string') {
+      metadata.responseId = result.responseId;
+    }
+    const response = result.response as Record<string, unknown> | undefined;
+    if (response) {
+      if (typeof response.conversationId === 'string') {
+        metadata.conversationId = response.conversationId;
+      }
+      if (typeof response.responseId === 'string') {
+        metadata.responseId = response.responseId;
+      }
+      const conversation = response.conversation as Record<string, unknown> | undefined;
+      if (!metadata.conversationId && conversation && typeof conversation.conversationId === 'string') {
+        metadata.conversationId = conversation.conversationId;
+      }
+      if (!metadata.conversationId && conversation && typeof conversation.id === 'string') {
+        metadata.conversationId = conversation.id;
+      }
+    }
+  }
+
+  // Handle direct metadata formats
+  if (!metadata.conversationId && typeof object.conversationId === 'string') {
+    metadata.conversationId = object.conversationId;
+  }
+  if (typeof object.responseId === 'string') {
+    metadata.responseId = object.responseId;
+  }
+
+  return metadata;
+}
+
 function emitToken(job: BridgeJob, token: string): void {
   if (!token || job.state === 'completed' || job.state === 'failed' || job.state === 'cancelled') {
     return;
@@ -765,6 +835,21 @@ function ingestGrokChunk(job: BridgeJob, chunk: string): void {
 
   let tokensEmitted = 0;
   for (const object of parsed.objects) {
+    const metadata = metadataFromGrokObject(object);
+    const metadataUpdate: GrokResponseMetadata = {};
+
+    if (job.conversationId === null && metadata.conversationId) {
+      job.conversationId = metadata.conversationId;
+      metadataUpdate.conversationId = metadata.conversationId;
+    }
+    if (job.responseId === null && metadata.responseId) {
+      job.responseId = metadata.responseId;
+      metadataUpdate.responseId = metadata.responseId;
+    }
+    if (Object.keys(metadataUpdate).length > 0) {
+      job.events.emit('metadata', metadataUpdate);
+    }
+
     const token = tokenFromGrokObject(object);
     if (token !== null) {
       emitToken(job, token);
@@ -821,6 +906,7 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
     job.events.off('done', onDone);
     job.events.off('error', onError);
     job.events.off('timing', onTiming);
+    job.events.off('metadata', onMetadata);
   };
 
   const finish = () => {
@@ -836,7 +922,21 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
     writeOpenAIStreamChunk(res, job, token, null);
   };
 
+  const onMetadata = (metadata: GrokResponseMetadata) => {
+    if (!ended && !res.destroyed) {
+      res.write(`event: grok-response-metadata\ndata: ${JSON.stringify(metadata)}\n\n`);
+    }
+  };
+
   const onDone = () => {
+    if ((job.conversationId || job.responseId) && !ended && !res.destroyed) {
+      res.write(
+        `event: grok-response-metadata\ndata: ${JSON.stringify({
+          conversationId: job.conversationId,
+          responseId: job.responseId,
+        })}\n\n`,
+      );
+    }
     writeOpenAIStreamChunk(res, job, '', 'stop');
     res.write('data: [DONE]\n\n');
     finish();
@@ -856,6 +956,7 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
   job.events.once('done', onDone);
   job.events.once('error', onError);
   job.events.on('timing', onTiming);
+  job.events.on('metadata', onMetadata);
   writeTiming();
 
   req.on('close', () => {
@@ -990,13 +1091,20 @@ async function handlePollJob(res: http.ServerResponse): Promise<void> {
     return;
   }
 
-  const template = job.isNewConversation ? newTemplateOverride : templateOverride;
+  const template = job.isNewConversation
+    ? newTemplateOverride
+    : job.conversationId
+      ? templateOverride ?? newTemplateOverride
+      : templateOverride;
 
   sendJson(res, 200, {
     id: job.id,
     createdAt: job.createdAt,
     model: job.model,
     prompt: job.prompt,
+    conversationId: job.conversationId,
+    parentResponseId: job.parentResponseId,
+    responseId: job.responseId,
     messages: job.request.messages ?? [],
     requestTemplate: template,
   });
@@ -1068,7 +1176,7 @@ function healthPayload() {
   };
 }
 
-async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+export async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   setCors(res);
 
   if (req.method === 'OPTIONS') {
@@ -1144,22 +1252,28 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   sendError(res, 404, 'Not found');
 }
 
-const server = http.createServer((req, res) => {
-  handleRequest(req, res).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!res.headersSent) {
-      sendError(res, 500, message);
-      return;
-    }
-    res.end();
+export function createProxyServer(): http.Server {
+  return http.createServer((req, res) => {
+    handleRequest(req, res).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!res.headersSent) {
+        sendError(res, 500, message);
+        return;
+      }
+      res.end();
+    });
   });
-});
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`Grok OpenAI-compatible proxy listening on http://${HOST}:${PORT}`);
-  console.log('Bridge mode: waiting for Chrome extension heartbeat on /bridge/heartbeat');
-});
+if (require.main === module) {
+  const server = createProxyServer();
 
-process.on('SIGTERM', () => {
-  server.close(() => process.exit(0));
-});
+  server.listen(PORT, HOST, () => {
+    console.log(`Grok OpenAI-compatible proxy listening on http://${HOST}:${PORT}`);
+    console.log('Bridge mode: waiting for Chrome extension heartbeat on /bridge/heartbeat');
+  });
+
+  process.on('SIGTERM', () => {
+    server.close(() => process.exit(0));
+  });
+}

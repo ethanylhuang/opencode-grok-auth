@@ -1,6 +1,6 @@
 const BRIDGE_ORIGIN = 'http://127.0.0.1:11434';
 const WORKER_ID = getWorkerId();
-const BACKGROUND_CODE_VERSION = 'template-override-health-v2';
+const BACKGROUND_CODE_VERSION = 'chat-session-routing-v1';
 const POLL_BACKOFF_MS = 1000;
 const JOB_RUN_TIMEOUT_MS = 180000;
 
@@ -270,8 +270,12 @@ async function postHeartbeat() {
     body: JSON.stringify({
       workerId: WORKER_ID,
       activeGrokTab: Boolean(tab),
-      hasRequestTemplate: Boolean(lastObservedRequest),
-      url: lastObservedRequest ? lastObservedRequest.referer || lastObservedRequest.url : '',
+      hasRequestTemplate: Boolean(lastObservedRequest || lastObservedNewRequest),
+      url: lastObservedRequest
+        ? lastObservedRequest.referer || lastObservedRequest.url
+        : lastObservedNewRequest
+          ? lastObservedNewRequest.referer || lastObservedNewRequest.url
+          : '',
       manifestVersion: chrome.runtime.getManifest().version,
       backgroundCodeVersion: BACKGROUND_CODE_VERSION,
       templateInstallSource: lastTemplateInstallSource,
@@ -353,7 +357,11 @@ async function runJobInGrokTab(job) {
   console.log('[bridge] runJobInGrokTab', { jobId: job.id, model: job.model });
 
   const isNew = job.model === 'grok-latest-new';
-  const fallbackTemplate = isNew ? lastObservedNewRequest : lastObservedRequest;
+  const fallbackTemplate = isNew
+    ? lastObservedNewRequest
+    : job.conversationId
+      ? lastObservedRequest || lastObservedNewRequest
+      : lastObservedRequest;
   const requestTemplate = isValidObservedRequest(job.requestTemplate) ? job.requestTemplate : fallbackTemplate;
 
   console.log('[bridge] template', { isNew, templateUrl: requestTemplate?.url });
