@@ -6,8 +6,8 @@
     <title>Grok Proxy Tester</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen p-4">
-    <main class="mx-auto flex w-full max-w-6xl flex-col gap-4">
+<body class="bg-zinc-950 text-zinc-100 h-screen overflow-hidden p-4">
+    <main class="mx-auto flex h-[calc(100vh-2rem)] min-h-0 w-full max-w-6xl flex-col gap-4">
         <header class="flex flex-wrap items-end justify-between gap-3">
             <div>
                 <h1 class="text-xl font-semibold text-zinc-100">Grok Bridge Tester</h1>
@@ -22,17 +22,23 @@
                     <h2 class="text-sm font-medium text-zinc-200">Bridge Health</h2>
                     <div id="healthSummary" class="mt-1 text-xs text-zinc-500">Checking proxy...</div>
                 </div>
-                <button id="refreshHealthBtn" type="button"
-                        class="rounded border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800">
-                    Refresh
-                </button>
+                <div class="flex gap-2">
+                    <button id="prewarmBtn" type="button"
+                            class="rounded border border-sky-700 px-3 py-1 text-xs text-sky-200 hover:bg-sky-950">
+                        Prewarm
+                    </button>
+                    <button id="refreshHealthBtn" type="button"
+                            class="rounded border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800">
+                        Refresh
+                    </button>
+                </div>
             </div>
-            <div id="healthGrid" class="grid gap-px bg-zinc-800 text-xs sm:grid-cols-3 lg:grid-cols-7"></div>
+            <div id="healthGrid" class="grid gap-px bg-zinc-800 text-xs sm:grid-cols-3 lg:grid-cols-10"></div>
             <div id="healthDetail" class="border-t border-zinc-800 px-4 py-2 font-mono text-[11px] text-zinc-500"></div>
         </section>
 
-        <section class="grid gap-4 lg:grid-cols-[280px_1fr_360px]">
-            <aside id="chatSidebar" class="rounded border border-zinc-800 bg-zinc-900 flex flex-col">
+        <section class="grid min-h-0 flex-1 gap-4 overflow-hidden lg:grid-cols-[280px_1fr_360px]">
+            <aside id="chatSidebar" class="min-h-0 rounded border border-zinc-800 bg-zinc-900 flex flex-col">
                 <div class="border-b border-zinc-800 px-4 py-3">
                     <button id="newChatBtn" type="button"
                             class="w-full rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500">
@@ -43,18 +49,18 @@
                 </div>
             </aside>
 
-            <div id="output" class="min-h-[360px] w-full overflow-auto rounded border border-zinc-800 bg-zinc-900 p-4 font-mono text-sm leading-6"></div>
+            <div id="output" class="min-h-0 w-full overflow-auto rounded border border-zinc-800 bg-zinc-900 p-4 font-mono text-sm leading-6"></div>
 
-            <aside class="rounded border border-zinc-800 bg-zinc-900">
+            <aside class="min-h-0 rounded border border-zinc-800 bg-zinc-900 flex flex-col overflow-hidden">
                 <div class="border-b border-zinc-800 px-4 py-3">
                     <h2 class="text-sm font-medium text-zinc-200">Timing</h2>
                     <div id="summary" class="mt-1 text-xs text-zinc-500">No request yet</div>
                 </div>
-                <div id="timings" class="divide-y divide-zinc-800 text-xs"></div>
+                <div id="timings" class="min-h-0 flex-1 overflow-auto divide-y divide-zinc-800 text-xs"></div>
             </aside>
         </section>
 
-        <form id="promptForm" class="flex gap-2">
+        <form id="promptForm" class="shrink-0 flex gap-2">
             <input type="text" id="prompt"
                    class="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
                    placeholder="Enter prompt..."
@@ -74,6 +80,8 @@
             ['requestStartedAt', 'Client request started', 'client'],
             ['requestReceivedAt', 'Proxy request received', 'server'],
             ['jobQueuedAt', 'Job queued', 'server'],
+            ['workerNotifiedAt', 'Worker notified', 'server'],
+            ['workerAcceptedAt', 'Worker accepted', 'server'],
             ['streamHeadersFlushedAt', 'SSE headers flushed', 'server'],
             ['jobAssignedAt', 'Job assigned', 'server'],
             ['contentScriptAcceptedAt', 'Content script accepted', 'server'],
@@ -81,6 +89,7 @@
             ['grokResponseHeadersAt', 'Grok response headers', 'server'],
             ['firstRawUpstreamChunkAt', 'First raw upstream chunk', 'server'],
             ['firstParsedNonThinkingTokenAt', 'First parsed visible token', 'server'],
+            ['firstSseChunkAt', 'First proxy SSE chunk', 'server'],
             ['firstSseChunkReceivedAt', 'First SSE chunk received', 'client'],
             ['firstVisibleTokenAt', 'First visible token rendered', 'client'],
             ['doneAt', 'Stream completed', 'client'],
@@ -97,6 +106,7 @@
         const healthGridDiv = document.getElementById('healthGrid');
         const healthDetailDiv = document.getElementById('healthDetail');
         const refreshHealthBtn = document.getElementById('refreshHealthBtn');
+        const prewarmBtn = document.getElementById('prewarmBtn');
         const newChatBtn = document.getElementById('newChatBtn');
         const chatList = document.getElementById('chatList');
 
@@ -151,6 +161,7 @@
             return {
                 role,
                 content: typeof value.content === 'string' ? value.content : String(value.content || ''),
+                reasoning: typeof value.reasoning === 'string' ? value.reasoning : '',
                 createdAt: typeof value.createdAt === 'number' ? value.createdAt : Date.now(),
             };
         }
@@ -222,6 +233,7 @@
             messages.push({
                 role: role === 'assistant' ? 'assistant' : 'user',
                 content: String(content || ''),
+                reasoning: '',
                 createdAt: Date.now(),
             });
             chat.updatedAt = Date.now();
@@ -250,6 +262,22 @@
             }
         }
 
+        function updateChatReasoning(chatId, messageIndex, updater) {
+            const chat = chatSessions.find(c => c.id === chatId);
+            if (!chat || !Array.isArray(chat.messages) || !chat.messages[messageIndex]) {
+                return;
+            }
+
+            const message = chat.messages[messageIndex];
+            message.reasoning = typeof updater === 'function' ? updater(message.reasoning || '') : String(updater || '');
+            chat.updatedAt = Date.now();
+            saveChatSessions();
+            renderChatList();
+            if (currentChatId === chatId) {
+                renderTranscript();
+            }
+        }
+
         function renderTranscript(chat = getCurrentChat()) {
             if (!chat || !Array.isArray(chat.messages) || chat.messages.length === 0) {
                 outputDiv.innerHTML = '';
@@ -258,9 +286,13 @@
 
             outputDiv.innerHTML = chat.messages.map((message) => {
                 const label = message.role === 'assistant' ? 'Assistant' : 'User';
+                const reasoning = message.role === 'assistant' && message.reasoning
+                    ? `<div class="mb-2 whitespace-pre-wrap text-zinc-500">${escapeHtml(message.reasoning)}</div>`
+                    : '';
                 return `
                     <div class="mb-4 last:mb-0">
                         <div class="mb-1 text-[11px] uppercase tracking-normal text-zinc-500">${label}</div>
+                        ${reasoning}
                         <div class="text-zinc-100 whitespace-pre-wrap">${escapeHtml(message.content || '')}</div>
                     </div>
                 `;
@@ -325,6 +357,9 @@
         refreshHealthBtn.addEventListener('click', () => {
             void refreshHealth();
         });
+        prewarmBtn.addEventListener('click', () => {
+            void prewarmBridge();
+        });
         newChatBtn.addEventListener('click', () => {
             void createNewChat();
             promptInput.focus();
@@ -349,6 +384,13 @@
             const prompt = promptInput.value.trim();
             if (!prompt) {
                 return;
+            }
+
+            if (lastHealth?.bridge?.warmReady !== true) {
+                const proceed = window.confirm('Grok bridge is not warm-ready. Send anyway?');
+                if (!proceed) {
+                    return;
+                }
             }
 
             let chat = getCurrentChat();
@@ -475,21 +517,47 @@
             }
         }
 
+        async function prewarmBridge() {
+            prewarmBtn.disabled = true;
+            prewarmBtn.innerText = '...';
+            try {
+                const response = await fetch(`${PROXY_URL}/bridge/prewarm`, { method: 'POST' });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+                statusDiv.innerText = 'Prewarm sent';
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                statusDiv.innerText = `Prewarm failed: ${message}`;
+            } finally {
+                prewarmBtn.disabled = false;
+                prewarmBtn.innerText = 'Prewarm';
+                void refreshHealth();
+            }
+        }
+
         function renderHealth(health, errorMessage = '') {
             const bridge = health?.bridge || {};
             const jobs = health?.jobs || {};
             const metrics = health?.metrics || {};
-            const ready = bridge.connected === true && bridge.activeGrokTab === true && bridge.hasRequestTemplate === true;
+            const ready = bridge.warmReady === true;
+            const requiredBackground = bridge.requiredBackgroundCodeVersion || '';
+            const backgroundMatches = !requiredBackground || bridge.backgroundCodeVersion === requiredBackground;
 
             if (errorMessage) {
                 healthSummaryDiv.innerText = `Proxy unavailable: ${errorMessage}`;
                 healthSummaryDiv.className = 'mt-1 text-xs text-red-400';
             } else if (ready) {
-                healthSummaryDiv.innerText = 'Ready: extension connected, Grok tab active, request template captured';
+                healthSummaryDiv.innerText = 'Warm-ready: extension, Grok tab, template, and fast channel are ready';
                 healthSummaryDiv.className = 'mt-1 text-xs text-emerald-400';
+            } else if (bridge.fallbackReady === true) {
+                healthSummaryDiv.innerText = 'Fallback-ready: push channel is cold, polling fallback can accept requests';
+                healthSummaryDiv.className = 'mt-1 text-xs text-amber-400';
             } else if (health) {
                 const missing = [];
                 if (bridge.connected !== true) missing.push('extension heartbeat');
+                if (bridge.connected === true && !backgroundMatches) missing.push(`extension ${requiredBackground}`);
+                if (bridge.fastPath?.enabled === true && bridge.controlChannelConnected !== true) missing.push('push channel');
                 if (bridge.activeGrokTab !== true) missing.push('active Grok tab');
                 if (bridge.hasRequestTemplate !== true) missing.push('request template');
                 healthSummaryDiv.innerText = `Not ready: missing ${missing.join(', ') || 'unknown bridge state'}`;
@@ -502,9 +570,12 @@
             healthGridDiv.innerHTML = [
                 healthCell('Proxy', errorMessage ? 'down' : health ? 'up' : '-', !errorMessage && Boolean(health)),
                 healthCell('Extension', boolText(bridge.connected), bridge.connected === true),
+                healthCell('Version', bridge.backgroundCodeVersion || '-', backgroundMatches),
+                healthCell('Fast Path', bridge.fastPath?.enabled === true ? 'on' : 'off', bridge.fastPath?.enabled === true),
+                healthCell('Push', boolText(bridge.controlChannelConnected), bridge.fastPath?.enabled !== true || bridge.controlChannelConnected === true),
                 healthCell('Grok Tab', boolText(bridge.activeGrokTab), bridge.activeGrokTab === true),
                 healthCell('Template', boolText(bridge.hasRequestTemplate), bridge.hasRequestTemplate === true),
-                healthCell('New Tmpl', boolText(bridge.proxyHasNewTemplateOverride), bridge.proxyHasNewTemplateOverride === true),
+                healthCell('Native', valueText(bridge.nativeTimingSamples), (bridge.nativeTimingSamples || 0) > 0),
                 healthCell('Queued', valueText(jobs.queued), jobs.queued === 0),
                 healthCell('Failed', valueText(metrics.failedJobs), (metrics.failedJobs || 0) === 0),
             ].join('');
@@ -515,6 +586,13 @@
             }
             if (bridge.workerId) {
                 detail.push(`worker=${bridge.workerId}`);
+            }
+            if (Array.isArray(bridge.connectedWorkerIds)) {
+                detail.push(`pushWorkers=${bridge.connectedWorkerIds.length}`);
+            }
+            if (bridge.fastPath) {
+                detail.push(`fastPath=${bridge.fastPath.enabled ? 'on' : 'off'}`);
+                detail.push(`pollFallback=${bridge.fastPath.pollingFallbackEnabled ? 'on' : 'off'}`);
             }
             if (bridge.url) {
                 detail.push(`template=${bridge.url}`);
@@ -531,11 +609,23 @@
             if (bridge.backgroundCodeVersion) {
                 detail.push(`background=${bridge.backgroundCodeVersion}`);
             }
+            if (requiredBackground) {
+                detail.push(`requiredBackground=${requiredBackground}`);
+            }
             if (bridge.templateInstallSource) {
                 detail.push(`templateSource=${bridge.templateInstallSource}`);
             }
             if (bridge.templateInstallError) {
                 detail.push(`templateError=${bridge.templateInstallError}`);
+            }
+            if (bridge.latestNativeTiming?.timings) {
+                const native = bridge.latestNativeTiming.timings;
+                if (typeof native.nativeFetchStartedAt === 'number' && typeof native.nativeFirstParsedVisibleTokenAt === 'number') {
+                    detail.push(`nativeTTFT=${native.nativeFirstParsedVisibleTokenAt - native.nativeFetchStartedAt}ms`);
+                }
+                if (bridge.latestNativeTiming.status !== undefined && bridge.latestNativeTiming.status !== null) {
+                    detail.push(`nativeStatus=${bridge.latestNativeTiming.status}`);
+                }
             }
             if (health) {
                 detail.push(`activeJobs=${valueText(jobs.active)}`);
@@ -543,6 +633,7 @@
                 detail.push(`completed=${valueText(metrics.completedJobs)}`);
                 detail.push(`rawChunks=${valueText(metrics.rawChunks)}`);
                 detail.push(`tokens=${valueText(metrics.emittedTokens)}`);
+                detail.push(`nativeSamples=${valueText(metrics.nativeTimingSamples)}`);
             }
             healthDetailDiv.innerText = detail.join('  ');
         }
@@ -631,7 +722,14 @@
             }
 
             const json = JSON.parse(data);
-            const content = json.choices?.[0]?.delta?.content || '';
+            const delta = json.choices?.[0]?.delta || {};
+            const reasoning = delta.reasoning_content || delta.reasoning || '';
+            if (reasoning) {
+                markClient('firstVisibleTokenAt');
+                updateChatReasoning(chatId, assistantMessageIndex, (current) => `${current || ''}${reasoning}`);
+            }
+
+            const content = delta.content || '';
             if (content) {
                 markClient('firstVisibleTokenAt');
                 updateChatMessage(chatId, assistantMessageIndex, (current) => `${current || ''}${content}`);

@@ -14,6 +14,12 @@
     "test-chat-history-ui": "node --import tsx scripts/test-chat-history-ui.ts",
     "test-extension-routing": "node --import tsx scripts/test-extension-routing.ts",
     "test-proxy-client": "tsx scripts/test-proxy-client.ts",
+    "test-latency": "tsx scripts/test-latency.ts",
+    "test-latency:m4-baseline": "GROK_LATENCY_RESUME=1 GROK_LATENCY_SAMPLES=30 GROK_LATENCY_DELAY_MS=30000 GROK_LATENCY_MAX_ATTEMPTS=60 GROK_LATENCY_STOP_AFTER_CONSECUTIVE_429=3 GROK_LATENCY_OUTPUT=artifacts/m4-baseline-polling.json node --import tsx scripts/test-latency.ts",
+    "test-latency:m4-fastpath": "GROK_LATENCY_RESUME=1 GROK_LATENCY_SAMPLES=30 GROK_LATENCY_DELAY_MS=30000 GROK_LATENCY_MAX_ATTEMPTS=60 GROK_LATENCY_STOP_AFTER_CONSECUTIVE_429=3 GROK_LATENCY_BASELINE=artifacts/m4-baseline-polling.json GROK_LATENCY_OUTPUT=artifacts/m4-fastpath-output-comparison.json node --import tsx scripts/test-latency.ts",
+    "test-latency:m4-final": "GROK_LATENCY_RESUME=1 GROK_LATENCY_SAMPLES=30 GROK_LATENCY_DELAY_MS=30000 GROK_LATENCY_MAX_ATTEMPTS=60 GROK_LATENCY_STOP_AFTER_CONSECUTIVE_429=3 GROK_LATENCY_REQUIRE_NATIVE=1 GROK_LATENCY_BASELINE=artifacts/m4-baseline-polling.json GROK_LATENCY_OUTPUT=artifacts/m4-final-native-output-comparison.json node --import tsx scripts/test-latency.ts",
+    "native-probe:m4": "node --import tsx scripts/native-probe.ts",
+    "verify-m4": "tsx scripts/verify-m4-evidence.ts",
     "refresh-cookie": "tsx scripts/refresh-cookie.ts"
   },
   "keywords": [],

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenCode Grok Auth Bridge",
-  "version": "0.1.3",
+  "version": "0.1.11",
   "description": "Local-only bridge between OpenCode and an authenticated grok.com browser session.",
   "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": [

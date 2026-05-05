@@ -1,0 +1,93 @@
+{
+  "generatedAt": "2026-05-04T18:09:27.892Z",
+  "url": "http://127.0.0.1:11434/v1/chat/completions",
+  "model": "grok-latest",
+  "samplesRequested": 1,
+  "attempts": 1,
+  "successfulSamples": 1,
+  "failedSamples": 0,
+  "samples": [
+    {
+      "index": 1,
+      "ok": true,
+      "jobId": "e5a550d6-867f-41fe-8482-08264f75dce5",
+      "ttftMs": 287.130542,
+      "contentTtftMs": 30441.0735,
+      "totalMs": 31834.170458,
+      "dispatchMs": 1,
+      "upstreamToSseMs": 44,
+      "bridgeVisibleOverheadMs": 0,
+      "phases": {
+        "requestReceivedAt": 2,
+        "jobQueuedAt": 2,
+        "jobAssignedAt": 2,
+        "workerNotifiedAt": 2,
+        "streamHeadersFlushedAt": 2,
+        "workerAcceptedAt": 3,
+        "contentScriptAcceptedAt": 5,
+        "grokFetchStartedAt": 5,
+        "grokResponseHeadersAt": 236,
+        "firstRawUpstreamChunkAt": 243,
+        "firstParsedReasoningTokenAt": 286,
+        "firstSseChunkAt": 287,
+        "firstParsedNonThinkingTokenAt": 30441
+      }
+    }
+  ],
+  "summary": {
+    "ttftMs": {
+      "count": 1,
+      "p50": 287.130542,
+      "p95": 287.130542,
+      "p99": 287.130542,
+      "min": 287.130542,
+      "max": 287.130542
+    },
+    "contentTtftMs": {
+      "count": 1,
+      "p50": 30441.0735,
+      "p95": 30441.0735,
+      "p99": 30441.0735,
+      "min": 30441.0735,
+      "max": 30441.0735
+    },
+    "dispatchMs": {
+      "count": 1,
+      "p50": 1,
+      "p95": 1,
+      "p99": 1,
+      "min": 1,
+      "max": 1
+    },
+    "upstreamToSseMs": {
+      "count": 1,
+      "p50": 44,
+      "p95": 44,
+      "p99": 44,
+      "min": 44,
+      "max": 44
+    },
+    "bridgeVisibleOverheadMs": {
+      "count": 1,
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  "comparison": {
+    "nativeEndpoint": {
+      "url": "http://127.0.0.1:11434/bridge/native-timings",
+      "count": 0,
+      "summary": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "min": null,
+        "max": null
+      },
+      "deltaP50Ms": null
+    }
+  }
+}

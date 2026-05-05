@@ -11,6 +11,11 @@ const EXTENSION_TTL_MS = Number(process.env.GROK_EXTENSION_TTL_MS ?? 60_000);
 const JOB_TIMEOUT_MS = Number(process.env.GROK_JOB_TIMEOUT_MS ?? 120_000);
 const LONG_POLL_MS = Number(process.env.GROK_LONG_POLL_MS ?? 25_000);
 const MAX_BODY_BYTES = Number(process.env.GROK_MAX_BODY_BYTES ?? 1_000_000);
+const FAST_PATH_ENABLED = process.env.GROK_FAST_PATH !== '0';
+const POLL_FALLBACK_ENABLED = process.env.GROK_POLL_FALLBACK !== '0';
+const DEBUG_PARSE = process.env.GROK_DEBUG_PARSE === '1';
+const REQUIRED_BACKGROUND_CODE_VERSION = 'm4-push-port-v8';
+const PUSH_KEEPALIVE_MS = Number(process.env.GROK_PUSH_KEEPALIVE_MS ?? 15_000);
 const CHROME_PROFILE_DIR =
   process.env.GROK_CHROME_PROFILE_DIR ??
   path.join(os.homedir(), 'Library/Application Support/Google/Chrome/Default');
@@ -43,6 +48,14 @@ type BridgeHeartbeat = {
   templateInstallError?: string;
 };
 
+type NativeTimingBody = {
+  workerId?: unknown;
+  url?: unknown;
+  status?: unknown;
+  timings?: unknown;
+  error?: unknown;
+};
+
 type BridgeTemplate = {
   url?: unknown;
   body?: unknown;
@@ -55,13 +68,17 @@ type JobState = 'queued' | 'assigned' | 'streaming' | 'completed' | 'failed' | '
 const TIMING_NAMES = [
   'requestReceivedAt',
   'jobQueuedAt',
+  'workerNotifiedAt',
+  'workerAcceptedAt',
   'jobAssignedAt',
   'streamHeadersFlushedAt',
   'contentScriptAcceptedAt',
   'grokFetchStartedAt',
   'grokResponseHeadersAt',
   'firstRawUpstreamChunkAt',
+  'firstParsedReasoningTokenAt',
   'firstParsedNonThinkingTokenAt',
+  'firstSseChunkAt',
 ] as const;
 type TimingName = (typeof TIMING_NAMES)[number];
 type TimingMap = Partial<Record<TimingName, number>>;
@@ -90,6 +107,27 @@ type BridgeJob = {
   events: EventEmitter;
 };
 
+type WorkerConnection = {
+  workerId: string;
+  connectedAt: number;
+  lastSeenAt: number;
+  capabilities: string[];
+  res: http.ServerResponse;
+  keepalive: NodeJS.Timeout;
+};
+
+type WorkerHeartbeat = {
+  at: number;
+  workerId: string;
+  activeGrokTab: boolean;
+  hasRequestTemplate: boolean;
+  url: string;
+  manifestVersion: string;
+  backgroundCodeVersion: string;
+  templateInstallSource: string;
+  templateInstallError: string;
+};
+
 type ParsedObjects = {
   objects: unknown[];
   remainder: string;
@@ -107,6 +145,17 @@ const RESPONSE_ID_KEYS = ['responseId', 'response_id', 'responseID'] as const;
 const jobs = new Map<string, BridgeJob>();
 const queue: string[] = [];
 const waiters: Array<() => void> = [];
+const workerConnections = new Map<string, WorkerConnection>();
+const workerHeartbeats = new Map<string, WorkerHeartbeat>();
+const nativeTimings: Array<{
+  observedAt: number;
+  workerId: string | null;
+  url: string | null;
+  status: number | null;
+  error: string | null;
+  timings: Record<string, number>;
+}> = [];
+const MAX_NATIVE_TIMINGS = 200;
 
 const metrics = {
   createdJobs: 0,
@@ -115,11 +164,21 @@ const metrics = {
   failedJobs: 0,
   cancelledJobs: 0,
   rawChunks: 0,
+  emittedReasoningTokens: 0,
+  emittedReasoningBytes: 0,
   emittedTokens: 0,
   emittedBytes: 0,
+  pushConnections: 0,
+  pushDisconnects: 0,
+  pushedJobs: 0,
+  polledJobs: 0,
+  acceptedJobs: 0,
+  prewarmRequests: 0,
+  nativeProbeRequests: 0,
+  nativeTimingSamples: 0,
 };
 
-let lastHeartbeat = {
+let lastHeartbeat: WorkerHeartbeat = {
   at: 0,
   workerId: '',
   activeGrokTab: false,
@@ -439,34 +498,160 @@ function ensureTemplateOverrideRecovered(): void {
   }
 }
 
+function connectedHeartbeats(now = Date.now()): WorkerHeartbeat[] {
+  const connected: WorkerHeartbeat[] = [];
+
+  for (const [workerId, heartbeat] of workerHeartbeats) {
+    if (now - heartbeat.at <= EXTENSION_TTL_MS) {
+      connected.push(heartbeat);
+    } else {
+      workerHeartbeats.delete(workerId);
+    }
+  }
+
+  return connected;
+}
+
+function heartbeatHasTemplate(heartbeat: WorkerHeartbeat | undefined, proxyHasTemplate: boolean): boolean {
+  return Boolean(heartbeat?.hasRequestTemplate || proxyHasTemplate);
+}
+
+function isRequiredWorkerVersion(heartbeat: WorkerHeartbeat | undefined): boolean {
+  return heartbeat?.backgroundCodeVersion === REQUIRED_BACKGROUND_CODE_VERSION;
+}
+
+function displayHeartbeat(heartbeats: WorkerHeartbeat[], connectedWorkerIds: string[]): WorkerHeartbeat {
+  const currentConnected = heartbeats.find((heartbeat) => {
+    return isRequiredWorkerVersion(heartbeat) && connectedWorkerIds.includes(heartbeat.workerId);
+  });
+  if (currentConnected) {
+    return currentConnected;
+  }
+
+  const current = heartbeats.find(isRequiredWorkerVersion);
+  if (current) {
+    return current;
+  }
+
+  const m4Connected = heartbeats.find((heartbeat) => {
+    return heartbeat.backgroundCodeVersion.startsWith('m4-push-port-') && connectedWorkerIds.includes(heartbeat.workerId);
+  });
+  if (m4Connected) {
+    return m4Connected;
+  }
+
+  return heartbeats[0] ?? lastHeartbeat;
+}
+
 function bridgeStatus() {
   ensureTemplateOverrideRecovered();
 
-  const ageMs = lastHeartbeat.at === 0 ? null : Date.now() - lastHeartbeat.at;
-  const connected = ageMs !== null && ageMs <= EXTENSION_TTL_MS;
+  const now = Date.now();
   const proxyHasTemplateOverride = Boolean(templateOverride);
   const proxyHasNewTemplateOverride = Boolean(newTemplateOverride);
+  const proxyHasAnyTemplateOverride = proxyHasTemplateOverride || proxyHasNewTemplateOverride;
+  const heartbeats = connectedHeartbeats(now);
+  const connectedWorkerIds = Array.from(workerConnections.keys());
+  const heartbeat = displayHeartbeat(heartbeats, connectedWorkerIds);
+  const ageMs = heartbeat.at === 0 ? null : now - heartbeat.at;
+  const connected = heartbeats.length > 0;
+  const controlChannelConnected = connectedWorkerIds.length > 0;
+  const readyWorkerIds = connectedWorkerIds.filter((workerId) => {
+    const workerHeartbeat = workerHeartbeats.get(workerId);
+    return (
+      workerHeartbeat &&
+      isRequiredWorkerVersion(workerHeartbeat) &&
+      now - workerHeartbeat.at <= EXTENSION_TTL_MS &&
+      workerHeartbeat.activeGrokTab &&
+      heartbeatHasTemplate(workerHeartbeat, proxyHasAnyTemplateOverride)
+    );
+  });
+  const activeGrokTab = heartbeats.some((item) => item.activeGrokTab);
+  const extensionHasRequestTemplate = heartbeats.some((item) => item.hasRequestTemplate);
+  const hasRequestTemplate = extensionHasRequestTemplate || proxyHasAnyTemplateOverride;
+  const fallbackWorkerReady = heartbeats.some((item) => {
+    return (
+      isRequiredWorkerVersion(item) &&
+      item.activeGrokTab &&
+      heartbeatHasTemplate(item, proxyHasAnyTemplateOverride)
+    );
+  });
+  const warmReady =
+    connected &&
+    activeGrokTab &&
+    hasRequestTemplate &&
+    (!FAST_PATH_ENABLED || readyWorkerIds.length > 0);
+  const fallbackReady =
+    FAST_PATH_ENABLED &&
+    POLL_FALLBACK_ENABLED &&
+    fallbackWorkerReady;
+  const requestReady = warmReady || fallbackReady;
 
   return {
     connected,
     ageMs,
-    workerId: lastHeartbeat.workerId || null,
-    activeGrokTab: lastHeartbeat.activeGrokTab,
-    hasRequestTemplate: lastHeartbeat.hasRequestTemplate || proxyHasTemplateOverride || proxyHasNewTemplateOverride,
-    extensionHasRequestTemplate: lastHeartbeat.hasRequestTemplate,
+    workerId: heartbeat.workerId || null,
+    activeGrokTab,
+    hasRequestTemplate,
+    extensionHasRequestTemplate,
     proxyHasTemplateOverride,
     proxyHasNewTemplateOverride,
-    url: lastHeartbeat.url || null,
-    manifestVersion: lastHeartbeat.manifestVersion || null,
-    backgroundCodeVersion: lastHeartbeat.backgroundCodeVersion || null,
-    templateInstallSource: lastHeartbeat.templateInstallSource || null,
-    templateInstallError: lastHeartbeat.templateInstallError || null,
+    warmReady,
+    fallbackReady,
+    requestReady,
+    controlChannelConnected,
+    connectedWorkerIds,
+    readyWorkerIds,
+    requiredBackgroundCodeVersion: REQUIRED_BACKGROUND_CODE_VERSION,
+    fastPath: {
+      enabled: FAST_PATH_ENABLED,
+      pollingFallbackEnabled: POLL_FALLBACK_ENABLED,
+    },
+    workers: heartbeats.map((item) => ({
+      workerId: item.workerId,
+      ageMs: now - item.at,
+      activeGrokTab: item.activeGrokTab,
+      hasRequestTemplate: item.hasRequestTemplate,
+      manifestVersion: item.manifestVersion || null,
+      backgroundCodeVersion: item.backgroundCodeVersion || null,
+    })),
+    nativeTimingSamples: nativeTimings.length,
+    latestNativeTiming: nativeTimings[nativeTimings.length - 1] ?? null,
+    url: heartbeat.url || null,
+    manifestVersion: heartbeat.manifestVersion || null,
+    backgroundCodeVersion: heartbeat.backgroundCodeVersion || null,
+    templateInstallSource: heartbeat.templateInstallSource || null,
+    templateInstallError: heartbeat.templateInstallError || null,
   };
 }
 
-function isBridgeReady(): boolean {
-  const status = bridgeStatus();
-  return status.connected && status.activeGrokTab && status.hasRequestTemplate;
+function bridgeNotReadyMessage(status: ReturnType<typeof bridgeStatus>): string {
+  if (
+    status.connected &&
+    status.requiredBackgroundCodeVersion &&
+    status.backgroundCodeVersion &&
+    status.backgroundCodeVersion !== status.requiredBackgroundCodeVersion
+  ) {
+    const manifest = status.manifestVersion ? ` manifest ${status.manifestVersion},` : '';
+    return `Grok extension bridge is stale. Loaded${manifest} background ${status.backgroundCodeVersion}; required background ${status.requiredBackgroundCodeVersion}. Reload the unpacked extension and refresh grok.com.`;
+  }
+
+  const missing: string[] = [];
+  if (!status.connected) {
+    missing.push('extension heartbeat');
+  }
+  if (status.activeGrokTab !== true) {
+    missing.push('active Grok tab');
+  }
+  if (status.hasRequestTemplate !== true) {
+    missing.push('request template');
+  }
+  if (status.fastPath.enabled && status.controlChannelConnected !== true) {
+    missing.push('push channel');
+  }
+
+  const suffix = missing.length > 0 ? ` Missing: ${missing.join(', ')}.` : '';
+  return `Grok extension bridge is not ready.${suffix} Open grok.com in Chrome, install or reload the extension, and send one normal Grok message so the request template can be captured.`;
 }
 
 function wantsDebugTiming(req: http.IncomingMessage): boolean {
@@ -494,7 +679,7 @@ function createJob(
     id: randomUUID(),
     createdAt: queuedAt,
     assignedAt: null,
-    workerId: lastHeartbeat.workerId || null,
+    workerId: null,
     state: 'queued',
     request,
     prompt,
@@ -521,6 +706,7 @@ function createJob(
   queue.push(job.id);
   metrics.createdJobs += 1;
   notifyWaiters();
+  dispatchQueuedJobs();
 
   return job;
 }
@@ -551,6 +737,22 @@ function normalizeTimingMap(value: unknown): TimingMap {
   for (const [name, at] of Object.entries(value as Record<string, unknown>)) {
     if (TIMING_NAME_SET.has(name) && typeof at === 'number' && Number.isFinite(at)) {
       timings[name as TimingName] = at;
+    }
+  }
+
+  return timings;
+}
+
+function normalizeLooseTimings(value: unknown): Record<string, number> {
+  const timings: Record<string, number> = {};
+
+  if (!value || typeof value !== 'object') {
+    return timings;
+  }
+
+  for (const [name, at] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof name === 'string' && typeof at === 'number' && Number.isFinite(at)) {
+      timings[name] = at;
     }
   }
 
@@ -590,6 +792,7 @@ function completeJob(job: BridgeJob): void {
   metrics.completedJobs += 1;
   job.events.emit('done');
   removeJob(job);
+  dispatchQueuedJobs();
 }
 
 function failJob(job: BridgeJob, message: string): void {
@@ -602,6 +805,7 @@ function failJob(job: BridgeJob, message: string): void {
   metrics.failedJobs += 1;
   job.events.emit('error', message);
   removeJob(job);
+  dispatchQueuedJobs();
 }
 
 function cancelJob(job: BridgeJob): void {
@@ -613,6 +817,7 @@ function cancelJob(job: BridgeJob): void {
   metrics.cancelledJobs += 1;
   job.events.emit('error', 'Client disconnected before completion');
   removeJob(job);
+  dispatchQueuedJobs();
 }
 
 function dequeueJob(workerId = ''): BridgeJob | null {
@@ -630,6 +835,9 @@ function dequeueJob(workerId = ''): BridgeJob | null {
     const job = id ? jobs.get(id) : null;
     if (job && job.state === 'queued' && (!workerId || !job.workerId || job.workerId === workerId)) {
       job.state = 'assigned';
+      if (workerId) {
+        job.workerId = workerId;
+      }
       job.assignedAt = Date.now();
       markTiming(job, 'jobAssignedAt', job.assignedAt);
       metrics.assignedJobs += 1;
@@ -647,7 +855,7 @@ function notifyWaiters(): void {
   }
 }
 
-function waitForJob(workerId = ''): Promise<BridgeJob | null> {
+function waitForJob(workerId = '', timeoutMs = LONG_POLL_MS): Promise<BridgeJob | null> {
   const available = dequeueJob(workerId);
   if (available) {
     return Promise.resolve(available);
@@ -661,7 +869,7 @@ function waitForJob(workerId = ''): Promise<BridgeJob | null> {
       }
       settled = true;
       resolve(null);
-    }, LONG_POLL_MS);
+    }, timeoutMs);
 
     waiters.push(() => {
       if (settled) {
@@ -672,6 +880,158 @@ function waitForJob(workerId = ''): Promise<BridgeJob | null> {
       resolve(dequeueJob(workerId));
     });
   });
+}
+
+function hasActiveJobForWorker(workerId: string): boolean {
+  for (const job of jobs.values()) {
+    if (
+      job.workerId === workerId &&
+      (job.state === 'assigned' || job.state === 'streaming')
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isWorkerWarmReady(workerId: string): boolean {
+  ensureTemplateOverrideRecovered();
+  const heartbeat = workerHeartbeats.get(workerId);
+  if (!heartbeat || Date.now() - heartbeat.at > EXTENSION_TTL_MS) {
+    return false;
+  }
+
+  return (
+    isRequiredWorkerVersion(heartbeat) &&
+    heartbeat.activeGrokTab &&
+    heartbeatHasTemplate(heartbeat, Boolean(templateOverride || newTemplateOverride))
+  );
+}
+
+function pollWorkerNotReadyMessage(workerId: string): string {
+  const heartbeat = workerHeartbeats.get(workerId);
+  if (!heartbeat || Date.now() - heartbeat.at > EXTENSION_TTL_MS) {
+    return `Worker ${workerId} is not registered or heartbeat is stale`;
+  }
+  if (!isRequiredWorkerVersion(heartbeat)) {
+    return `Worker ${workerId} is stale: loaded background ${heartbeat.backgroundCodeVersion || 'unknown'}; required background ${REQUIRED_BACKGROUND_CODE_VERSION}`;
+  }
+  if (!heartbeat.activeGrokTab) {
+    return `Worker ${workerId} does not have an active Grok tab`;
+  }
+  if (!heartbeatHasTemplate(heartbeat, Boolean(templateOverride || newTemplateOverride))) {
+    return `Worker ${workerId} does not have a request template`;
+  }
+  return `Worker ${workerId} is not ready`;
+}
+
+function jobPayload(job: BridgeJob) {
+  const template = job.isNewConversation
+    ? newTemplateOverride
+    : job.conversationId
+      ? templateOverride ?? newTemplateOverride
+      : newTemplateOverride ?? templateOverride;
+
+  return {
+    id: job.id,
+    createdAt: job.createdAt,
+    model: job.model,
+    prompt: job.prompt,
+    conversationId: job.conversationId,
+    parentResponseId: job.parentResponseId,
+    responseId: job.responseId,
+    messages: job.request.messages ?? [],
+    requestTemplate: template,
+  };
+}
+
+function writeWorkerEvent(connection: WorkerConnection, event: string, payload: unknown): boolean {
+  if (connection.res.destroyed || connection.res.writableEnded) {
+    return false;
+  }
+
+  connection.lastSeenAt = Date.now();
+  try {
+    connection.res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function requeueJob(job: BridgeJob): void {
+  if (!jobs.has(job.id) || job.state === 'completed' || job.state === 'failed' || job.state === 'cancelled') {
+    return;
+  }
+
+  job.state = 'queued';
+  job.assignedAt = null;
+  queue.unshift(job.id);
+}
+
+function dispatchQueuedJobs(): void {
+  if (!FAST_PATH_ENABLED || queue.length === 0 || workerConnections.size === 0) {
+    return;
+  }
+
+  for (const connection of workerConnections.values()) {
+    if (queue.length === 0) {
+      return;
+    }
+
+    if (!isWorkerWarmReady(connection.workerId) || hasActiveJobForWorker(connection.workerId)) {
+      continue;
+    }
+
+    const job = dequeueJob(connection.workerId);
+    if (!job) {
+      continue;
+    }
+
+    const workerNotifiedAt = Date.now();
+    markTiming(job, 'workerNotifiedAt', workerNotifiedAt);
+    const sent = writeWorkerEvent(connection, 'job', {
+      ...jobPayload(job),
+      timings: timingSnapshot(job),
+    });
+
+    if (!sent) {
+      requeueJob(job);
+      workerConnections.delete(connection.workerId);
+      metrics.pushDisconnects += 1;
+      continue;
+    }
+
+    metrics.pushedJobs += 1;
+  }
+}
+
+function broadcastWorkerEvent(event: string, payload: unknown): number {
+  let sent = 0;
+
+  for (const connection of workerConnections.values()) {
+    if (writeWorkerEvent(connection, event, payload)) {
+      sent++;
+    }
+  }
+
+  return sent;
+}
+
+function broadcastReadyWorkerEvent(event: string, payload: unknown): number {
+  let sent = 0;
+
+  for (const connection of workerConnections.values()) {
+    if (!isWorkerWarmReady(connection.workerId)) {
+      continue;
+    }
+    if (writeWorkerEvent(connection, event, payload)) {
+      sent++;
+    }
+  }
+
+  return sent;
 }
 
 function parseConcatenatedJson(buffer: string): ParsedObjects {
@@ -770,6 +1130,73 @@ function tokenFromGrokObject(value: unknown): string | null {
   }
 
   return null;
+}
+
+function reasoningTokenFromGrokObject(value: unknown): string | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const object = value as Record<string, unknown>;
+  const result = object.result as Record<string, unknown> | undefined;
+  if (!result) {
+    return null;
+  }
+
+  const response = result.response as Record<string, unknown> | undefined;
+  if (response && response.isThinking === true && typeof response.token === 'string') {
+    return response.token;
+  }
+
+  if (result.isThinking === true && typeof result.token === 'string') {
+    return result.token;
+  }
+
+  return null;
+}
+
+function assistantMessageFromModelResponse(value: unknown): string | null {
+  const object = recordFrom(value);
+  if (!object) {
+    return null;
+  }
+
+  const message = object.message;
+  if (typeof message !== 'string' || message.length === 0) {
+    return null;
+  }
+
+  const sender = object.sender;
+  if (typeof sender === 'string' && sender.toLowerCase() !== 'assistant') {
+    return null;
+  }
+
+  return message;
+}
+
+function finalAssistantMessageFromGrokObject(value: unknown): string | null {
+  const object = recordFrom(value);
+  if (!object) {
+    return null;
+  }
+
+  const direct = assistantMessageFromModelResponse(object.modelResponse);
+  if (direct) {
+    return direct;
+  }
+
+  const result = recordFrom(object.result);
+  if (!result) {
+    return null;
+  }
+
+  const resultMessage = assistantMessageFromModelResponse(result.modelResponse);
+  if (resultMessage) {
+    return resultMessage;
+  }
+
+  const response = recordFrom(result.response);
+  return assistantMessageFromModelResponse(response?.modelResponse);
 }
 
 function recordFrom(value: unknown): Record<string, unknown> | null {
@@ -987,6 +1414,18 @@ function emitToken(job: BridgeJob, token: string): void {
   job.events.emit('token', token);
 }
 
+function emitReasoningToken(job: BridgeJob, token: string): void {
+  if (!token || job.state === 'completed' || job.state === 'failed' || job.state === 'cancelled') {
+    return;
+  }
+
+  markTiming(job, 'firstParsedReasoningTokenAt');
+  job.state = 'streaming';
+  metrics.emittedReasoningTokens += 1;
+  metrics.emittedReasoningBytes += Buffer.byteLength(token);
+  job.events.emit('reasoning', token);
+}
+
 function ingestGrokChunk(job: BridgeJob, chunk: string): void {
   metrics.rawChunks += 1;
   job.parserBuffer += chunk;
@@ -1020,23 +1459,40 @@ function ingestGrokChunk(job: BridgeJob, chunk: string): void {
     if (token !== null) {
       emitToken(job, token);
       tokensEmitted++;
+      continue;
+    }
+
+    const reasoningToken = reasoningTokenFromGrokObject(object);
+    if (reasoningToken !== null) {
+      emitReasoningToken(job, reasoningToken);
+      tokensEmitted++;
+      continue;
+    }
+
+    const finalMessage = finalAssistantMessageFromGrokObject(object);
+    if (finalMessage !== null && job.text.length === 0) {
+      emitToken(job, finalMessage);
+      tokensEmitted++;
     }
   }
 
-  if (tokensEmitted === 0 && parsed.objects.length > 0) {
-    console.log(`[proxy] ingestGrokChunk: ${parsed.objects.length} objects but no tokens extracted. First object:`, JSON.stringify(parsed.objects[0]).slice(0, 200));
+  if (DEBUG_PARSE && tokensEmitted === 0 && parsed.objects.length > 0) {
+    console.log(
+      `[proxy] ingestGrokChunk: ${parsed.objects.length} objects but no tokens extracted. First object:`,
+      JSON.stringify(parsed.objects[0]).slice(0, 200),
+    );
   }
 }
 
 function writeOpenAIStreamChunk(
   res: http.ServerResponse,
   job: BridgeJob,
-  content: string,
+  delta: Record<string, unknown>,
   finishReason: string | null,
 ): void {
   const choice = finishReason
     ? { delta: {}, index: 0, finish_reason: finishReason }
-    : { delta: { content }, index: 0, finish_reason: null };
+    : { delta, index: 0, finish_reason: null };
 
   const payload = {
     id: `chatcmpl-${job.id}`,
@@ -1051,6 +1507,7 @@ function writeOpenAIStreamChunk(
 
 function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: BridgeJob): void {
   let ended = false;
+  res.socket?.setNoDelay(true);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -1069,6 +1526,7 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
 
   const cleanup = () => {
     job.events.off('token', onToken);
+    job.events.off('reasoning', onReasoning);
     job.events.off('done', onDone);
     job.events.off('error', onError);
     job.events.off('timing', onTiming);
@@ -1085,7 +1543,25 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
   };
 
   const onToken = (token: string) => {
-    writeOpenAIStreamChunk(res, job, token, null);
+    const firstSseChunk = job.timings.firstSseChunkAt === undefined;
+    if (firstSseChunk) {
+      job.timings.firstSseChunkAt = Date.now();
+    }
+    writeOpenAIStreamChunk(res, job, { content: token }, null);
+    if (firstSseChunk) {
+      job.events.emit('timing', timingSnapshot(job));
+    }
+  };
+
+  const onReasoning = (token: string) => {
+    const firstSseChunk = job.timings.firstSseChunkAt === undefined;
+    if (firstSseChunk) {
+      job.timings.firstSseChunkAt = Date.now();
+    }
+    writeOpenAIStreamChunk(res, job, { reasoning_content: token }, null);
+    if (firstSseChunk) {
+      job.events.emit('timing', timingSnapshot(job));
+    }
   };
 
   const onMetadata = (metadata: GrokResponseMetadata) => {
@@ -1103,7 +1579,7 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
         })}\n\n`,
       );
     }
-    writeOpenAIStreamChunk(res, job, '', 'stop');
+    writeOpenAIStreamChunk(res, job, {}, 'stop');
     res.write('data: [DONE]\n\n');
     finish();
   };
@@ -1119,6 +1595,7 @@ function streamJob(req: http.IncomingMessage, res: http.ServerResponse, job: Bri
   };
 
   job.events.on('token', onToken);
+  job.events.on('reasoning', onReasoning);
   job.events.once('done', onDone);
   job.events.once('error', onError);
   job.events.on('timing', onTiming);
@@ -1157,13 +1634,10 @@ function waitForCompletion(job: BridgeJob): Promise<string> {
 
 async function handleChat(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const requestReceivedAt = Date.now();
+  const bridge = bridgeStatus();
 
-  if (!isBridgeReady()) {
-    sendError(
-      res,
-      503,
-      'Grok extension bridge is not ready. Open grok.com in Chrome, install the extension, and send one normal Grok message so the request template can be captured.',
-    );
+  if (!bridge.requestReady) {
+    sendError(res, 503, bridgeNotReadyMessage(bridge));
     return;
   }
 
@@ -1212,7 +1686,7 @@ async function handleChat(req: http.IncomingMessage, res: http.ServerResponse): 
 
 async function handleHeartbeat(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const heartbeat = await readJson<BridgeHeartbeat>(req);
-  lastHeartbeat = {
+  const normalized: WorkerHeartbeat = {
     at: Date.now(),
     workerId: typeof heartbeat.workerId === 'string' ? heartbeat.workerId : '',
     activeGrokTab: heartbeat.activeGrokTab === true,
@@ -1223,6 +1697,12 @@ async function handleHeartbeat(req: http.IncomingMessage, res: http.ServerRespon
     templateInstallSource: typeof heartbeat.templateInstallSource === 'string' ? heartbeat.templateInstallSource : '',
     templateInstallError: typeof heartbeat.templateInstallError === 'string' ? heartbeat.templateInstallError : '',
   };
+  lastHeartbeat = normalized;
+  if (normalized.workerId) {
+    workerHeartbeats.set(normalized.workerId, normalized);
+  }
+
+  dispatchQueuedJobs();
 
   sendJson(res, 200, {
     ok: true,
@@ -1250,31 +1730,205 @@ async function handleBridgeTemplate(req: http.IncomingMessage, res: http.ServerR
 }
 
 async function handlePollJob(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
+  const explicitFallback = url.searchParams.get('fallback') === '1';
+  if (FAST_PATH_ENABLED && !explicitFallback) {
+    sendError(res, 409, 'Polling job acquisition is fallback-only while Grok fast path is enabled');
+    return;
+  }
+  if (!POLL_FALLBACK_ENABLED) {
+    sendError(res, 403, 'Polling fallback is disabled by GROK_POLL_FALLBACK=0');
+    return;
+  }
+
   const workerId = url.searchParams.get('workerId') || '';
-  const job = await waitForJob(workerId);
+  if (!workerId) {
+    sendError(res, 400, 'Expected workerId query parameter');
+    return;
+  }
+  if (!isWorkerWarmReady(workerId)) {
+    sendError(res, 409, pollWorkerNotReadyMessage(workerId));
+    return;
+  }
+
+  const requestedTimeoutMs = Number(url.searchParams.get('timeoutMs') ?? LONG_POLL_MS);
+  const timeoutMs = Number.isFinite(requestedTimeoutMs)
+    ? Math.max(0, Math.min(LONG_POLL_MS, requestedTimeoutMs))
+    : LONG_POLL_MS;
+  const job = await waitForJob(workerId, timeoutMs);
   if (!job) {
     res.writeHead(204);
     res.end();
     return;
   }
 
-  const template = job.isNewConversation
-    ? newTemplateOverride
-    : job.conversationId
-      ? templateOverride ?? newTemplateOverride
-      : templateOverride;
+  markTiming(job, 'workerNotifiedAt');
+  metrics.polledJobs += 1;
 
-  sendJson(res, 200, {
-    id: job.id,
-    createdAt: job.createdAt,
-    model: job.model,
-    prompt: job.prompt,
-    conversationId: job.conversationId,
-    parentResponseId: job.parentResponseId,
-    responseId: job.responseId,
-    messages: job.request.messages ?? [],
-    requestTemplate: template,
+  sendJson(res, 200, jobPayload(job));
+}
+
+async function handleWorkerEvents(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
+  if (!FAST_PATH_ENABLED) {
+    sendError(res, 409, 'Grok fast path is disabled by GROK_FAST_PATH=0');
+    return;
+  }
+
+  const workerId = url.searchParams.get('workerId') || '';
+  if (!workerId) {
+    sendError(res, 400, 'Expected workerId query parameter');
+    return;
+  }
+
+  const existing = workerConnections.get(workerId);
+  if (existing && !existing.res.destroyed && !existing.res.writableEnded) {
+    existing.res.end();
+    clearInterval(existing.keepalive);
+  }
+
+  res.socket?.setNoDelay(true);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
   });
+  res.flushHeaders();
+
+  const capabilities = (url.searchParams.get('capabilities') || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const connection: WorkerConnection = {
+    workerId,
+    connectedAt: Date.now(),
+    lastSeenAt: Date.now(),
+    capabilities,
+    res,
+    keepalive: setInterval(() => {
+      writeWorkerEvent(connection, 'heartbeat', { at: Date.now() });
+    }, PUSH_KEEPALIVE_MS),
+  };
+
+  workerConnections.set(workerId, connection);
+  metrics.pushConnections += 1;
+  writeWorkerEvent(connection, 'ready', {
+    workerId,
+    fastPath: true,
+    pollingFallbackEnabled: POLL_FALLBACK_ENABLED,
+  });
+  dispatchQueuedJobs();
+
+  req.on('close', () => {
+    if (workerConnections.get(workerId) === connection) {
+      workerConnections.delete(workerId);
+      metrics.pushDisconnects += 1;
+    }
+    clearInterval(connection.keepalive);
+  });
+}
+
+async function handleJobAccept(req: http.IncomingMessage, res: http.ServerResponse, jobId: string): Promise<void> {
+  const job = jobs.get(jobId);
+  if (!job) {
+    sendError(res, 404, `Unknown bridge job ${jobId}`);
+    return;
+  }
+
+  const body = await readJson<{ workerId?: unknown; timings?: unknown }>(req);
+  const timings = normalizeTimingMap(body.timings);
+  if (timings.workerAcceptedAt === undefined && job.timings.workerAcceptedAt === undefined) {
+    timings.workerAcceptedAt = Date.now();
+  }
+  if (typeof body.workerId === 'string' && body.workerId) {
+    job.workerId = body.workerId;
+  }
+
+  markTimings(job, timings);
+  metrics.acceptedJobs += 1;
+  sendJson(res, 200, { ok: true, timing: timingSnapshot(job) });
+}
+
+async function handlePrewarm(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  metrics.prewarmRequests += 1;
+  const sent = broadcastWorkerEvent('prewarm', { requestedAt: Date.now() });
+  sendJson(res, sent > 0 ? 202 : 503, {
+    ok: sent > 0,
+    sent,
+    bridge: bridgeStatus(),
+  });
+}
+
+async function handleNativeProbe(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  metrics.nativeProbeRequests += 1;
+  const body = await readJson<{ prompt?: unknown }>(req);
+  const prompt = typeof body.prompt === 'string' && body.prompt.trim() ? body.prompt.trim() : 'Say one word.';
+  const sent = broadcastReadyWorkerEvent('native-probe', { requestedAt: Date.now(), prompt });
+  sendJson(res, sent > 0 ? 202 : 503, {
+    ok: sent > 0,
+    sent,
+    bridge: bridgeStatus(),
+  });
+}
+
+async function handleNativeTiming(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await readJson<NativeTimingBody>(req);
+  const timings = normalizeLooseTimings(body.timings);
+  const sample = {
+    observedAt: Date.now(),
+    workerId: typeof body.workerId === 'string' && body.workerId ? body.workerId : null,
+    url: typeof body.url === 'string' ? body.url : null,
+    status: typeof body.status === 'number' && Number.isFinite(body.status) ? body.status : null,
+    error: typeof body.error === 'string' ? body.error.slice(0, 500) : null,
+    timings,
+  };
+
+  nativeTimings.push(sample);
+  if (nativeTimings.length > MAX_NATIVE_TIMINGS) {
+    nativeTimings.splice(0, nativeTimings.length - MAX_NATIVE_TIMINGS);
+  }
+  metrics.nativeTimingSamples += 1;
+
+  sendJson(res, 200, { ok: true, sample });
+}
+
+function nativeTimingsPayload() {
+  const samples = nativeTimings.map((sample) => {
+    const startedAt = sample.timings.nativeFetchStartedAt;
+    const firstVisibleAt =
+      sample.timings.nativeFirstParsedOutputTokenAt ??
+      sample.timings.nativeFirstParsedVisibleTokenAt ??
+      sample.timings.nativeFirstRawChunkAt;
+    const doneAt = sample.timings.nativeDoneAt;
+    return {
+      ...sample,
+      nativeTtftMs:
+        typeof startedAt === 'number' && typeof firstVisibleAt === 'number' ? firstVisibleAt - startedAt : null,
+      nativeTotalMs: typeof startedAt === 'number' && typeof doneAt === 'number' ? doneAt - startedAt : null,
+    };
+  });
+  const ttfts = samples
+    .map((sample) => sample.nativeTtftMs)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+    .sort((left, right) => left - right);
+
+  return {
+    count: samples.length,
+    summary: {
+      p50: percentile(ttfts, 0.5),
+      p95: percentile(ttfts, 0.95),
+      p99: percentile(ttfts, 0.99),
+      min: ttfts.length > 0 ? ttfts[0] : null,
+      max: ttfts.length > 0 ? ttfts[ttfts.length - 1] : null,
+    },
+    samples,
+  };
+}
+
+function percentile(values: number[], p: number): number | null {
+  if (values.length === 0) {
+    return null;
+  }
+  const index = Math.min(values.length - 1, Math.ceil(values.length * p) - 1);
+  return values[index] ?? null;
 }
 
 async function handleJobChunk(req: http.IncomingMessage, res: http.ServerResponse, jobId: string): Promise<void> {
@@ -1370,6 +2024,11 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
     return;
   }
 
+  if (req.method === 'GET' && path === '/bridge/native-timings') {
+    sendJson(res, 200, nativeTimingsPayload());
+    return;
+  }
+
   if (req.method === 'GET' && path === '/v1/models') {
     sendJson(res, 200, {
       object: 'list',
@@ -1388,8 +2047,34 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
     return;
   }
 
+  if (req.method === 'GET' && path === '/bridge/events') {
+    await handleWorkerEvents(req, res, url);
+    return;
+  }
+
+  if (req.method === 'POST' && path === '/bridge/prewarm') {
+    await handlePrewarm(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && path === '/bridge/native-probe') {
+    await handleNativeProbe(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && path === '/bridge/native-timing') {
+    await handleNativeTiming(req, res);
+    return;
+  }
+
   if (req.method === 'GET' && path === '/bridge/jobs') {
     await handlePollJob(req, res, url);
+    return;
+  }
+
+  const acceptMatch = path.match(/^\/bridge\/jobs\/([^/]+)\/accept$/);
+  if (req.method === 'POST' && acceptMatch?.[1]) {
+    await handleJobAccept(req, res, acceptMatch[1]);
     return;
   }
 

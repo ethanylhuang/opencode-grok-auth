@@ -1,0 +1,71 @@
+{
+  "generatedAt": "2026-05-04T06:58:34.841Z",
+  "url": "http://127.0.0.1:11434/v1/chat/completions",
+  "model": "grok-latest",
+  "samplesRequested": 1,
+  "attempts": 1,
+  "successfulSamples": 0,
+  "failedSamples": 1,
+  "samples": [
+    {
+      "index": 1,
+      "ok": false,
+      "jobId": "3b4fbedc-da52-4f63-9d3a-0b7f0210f39f",
+      "ttftMs": null,
+      "totalMs": 171.753167,
+      "dispatchMs": null,
+      "upstreamToSseMs": null,
+      "bridgeVisibleOverheadMs": null,
+      "phases": {},
+      "error": "Grok upstream returned HTTP 429: {\"error\":{\"code\":8,\"message\":\"Too many requests\",\"details\":[]}}\n"
+    }
+  ],
+  "summary": {
+    "ttftMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "dispatchMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "upstreamToSseMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "bridgeVisibleOverheadMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    }
+  },
+  "comparison": {
+    "nativeEndpoint": {
+      "url": "http://127.0.0.1:11434/bridge/native-timings",
+      "count": 0,
+      "summary": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "min": null,
+        "max": null
+      },
+      "deltaP50Ms": null
+    }
+  }
+}

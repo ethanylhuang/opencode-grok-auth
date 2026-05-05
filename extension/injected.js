@@ -2,10 +2,11 @@
   const PAGE_SOURCE = 'opencode-grok-auth-page';
   const EXTENSION_SOURCE = 'opencode-grok-auth-extension';
   const VERSION_KEY = '__opencodeGrokAuthBridgeVersion';
-  const VERSION = '10';
+  const VERSION = '14';
   const ORIGINAL_FETCH_KEY = '__opencodeGrokAuthOriginalFetch';
   const BRIDGE_REPLAY_MARKER = '__opencodeGrokBridgeReplay';
   const UI_FALLBACK_STORAGE_KEY = 'opencodeGrokAuthAllowUiFallback';
+  const DEBUG_STORAGE_KEY = 'opencodeGrokAuthDebug';
 
   if (window[VERSION_KEY] === VERSION) {
     return;
@@ -23,6 +24,9 @@
   window.fetch = function patchedFetch(input, init) {
     const url = requestUrl(input);
     const shouldObserve = isGrokResponseUrl(url);
+    const isReplay = shouldObserve && isBridgeReplayRequest(input, init);
+    const shouldCaptureNativeTiming = shouldObserve && !isReplay && !pendingUiJob;
+    const nativeFetchStartedAt = shouldCaptureNativeTiming ? Date.now() : 0;
 
     try {
       if (shouldObserve) {
@@ -33,6 +37,9 @@
     }
 
     const responsePromise = originalFetch(input, init);
+    if (shouldCaptureNativeTiming) {
+      captureNativeTiming(url, responsePromise, nativeFetchStartedAt);
+    }
     if (shouldObserve && pendingUiJob) {
       captureUiJobResponse(responsePromise, pendingUiJob);
       pendingUiJob = null;
@@ -48,6 +55,11 @@
 
     if (event.data.type === 'RUN_GROK_JOB_V2') {
       void runGrokJob(event.data.runId, event.data.job, event.data.requestTemplate);
+      return;
+    }
+
+    if (event.data.type === 'RUN_NATIVE_TIMING_PROBE') {
+      void runNativeTimingProbe(event.data.runId, event.data.prompt, event.data.requestTemplate);
     }
   });
 
@@ -123,8 +135,218 @@
     );
   }
 
+  function captureNativeTiming(url, responsePromise, nativeFetchStartedAt) {
+    void responsePromise
+      .then(async (response) => {
+        let reported = false;
+        const timings = {
+          nativeFetchStartedAt,
+          nativeResponseHeadersAt: Date.now(),
+        };
+        const detail = {
+          url,
+          status: response.status,
+          timings,
+        };
+
+        if (!response.ok) {
+          postNativeTiming({ ...detail, error: `HTTP ${response.status}` });
+          return;
+        }
+
+        try {
+          await readNativeTimingResponse(response.clone(), timings, () => {
+            if (!reported) {
+              reported = true;
+              postNativeTiming(detail);
+            }
+          });
+          if (!reported) {
+            postNativeTiming(detail);
+          }
+        } catch (error) {
+          if (!reported) {
+            postNativeTiming({
+              ...detail,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      })
+      .catch((error) => {
+        postNativeTiming({
+          url,
+          status: null,
+          timings: { nativeFetchStartedAt },
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
+
+  async function readNativeTimingResponse(response, timings, onFirstOutput) {
+    if (!response.body) {
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const read = await reader.read();
+      if (read.done) {
+        break;
+      }
+
+      if (!timings.nativeFirstRawChunkAt) {
+        timings.nativeFirstRawChunkAt = Date.now();
+      }
+
+      buffer += decoder.decode(read.value, { stream: true });
+      buffer = scanNativeVisibleToken(buffer, timings, onFirstOutput);
+    }
+
+    buffer += decoder.decode();
+    scanNativeVisibleToken(buffer, timings, onFirstOutput);
+    timings.nativeDoneAt = Date.now();
+  }
+
+  function scanNativeVisibleToken(buffer, timings, onFirstOutput) {
+    const parsed = parseConcatenatedJson(buffer);
+    for (const object of parsed.objects) {
+      if (!timings.nativeFirstParsedOutputTokenAt && outputTextFromGrokObject(object)) {
+        timings.nativeFirstParsedOutputTokenAt = Date.now();
+        if (typeof onFirstOutput === 'function') {
+          onFirstOutput();
+        }
+      }
+      if (!timings.nativeFirstParsedVisibleTokenAt && visibleTextFromGrokObject(object)) {
+        timings.nativeFirstParsedVisibleTokenAt = Date.now();
+      }
+    }
+    return parsed.remainder;
+  }
+
+  function parseConcatenatedJson(buffer) {
+    const objects = [];
+    let depth = 0;
+    let start = -1;
+    let lastEnd = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = 0; index < buffer.length; index += 1) {
+      const char = buffer[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === '{') {
+        if (depth === 0) {
+          start = index;
+        }
+        depth++;
+        continue;
+      }
+      if (char === '}') {
+        depth--;
+        if (depth === 0 && start !== -1) {
+          try {
+            objects.push(JSON.parse(buffer.slice(start, index + 1)));
+          } catch {
+          }
+          lastEnd = index + 1;
+          start = -1;
+        }
+      }
+    }
+
+    return {
+      objects,
+      remainder: start === -1 ? buffer.slice(lastEnd).trimStart() : buffer.slice(start),
+    };
+  }
+
+  function visibleTextFromGrokObject(value) {
+    const object = recordFrom(value);
+    if (!object) {
+      return '';
+    }
+
+    const result = recordFrom(object.result);
+    if (result) {
+      const response = recordFrom(result.response);
+      if (response && response.isThinking !== true && typeof response.token === 'string' && response.token) {
+        return response.token;
+      }
+      if (result.isThinking !== true && typeof result.token === 'string' && result.token) {
+        return result.token;
+      }
+      const resultMessage = assistantMessageFromModelResponse(result.modelResponse);
+      if (resultMessage) {
+        return resultMessage;
+      }
+      const responseModelMessage = assistantMessageFromModelResponse(response?.modelResponse);
+      if (responseModelMessage) {
+        return responseModelMessage;
+      }
+    }
+
+    if (typeof object.token === 'string' && object.token) {
+      return object.token;
+    }
+    return assistantMessageFromModelResponse(object.modelResponse);
+  }
+
+  function outputTextFromGrokObject(value) {
+    const object = recordFrom(value);
+    if (!object) {
+      return '';
+    }
+
+    const result = recordFrom(object.result);
+    if (result) {
+      const response = recordFrom(result.response);
+      if (response && typeof response.token === 'string' && response.token) {
+        return response.token;
+      }
+      if (typeof result.token === 'string' && result.token) {
+        return result.token;
+      }
+    }
+
+    return visibleTextFromGrokObject(value);
+  }
+
+  function assistantMessageFromModelResponse(value) {
+    const object = recordFrom(value);
+    if (!object || typeof object.message !== 'string' || object.message.length === 0) {
+      return '';
+    }
+    if (typeof object.sender === 'string' && object.sender.toLowerCase() !== 'assistant') {
+      return '';
+    }
+    return object.message;
+  }
+
+  function recordFrom(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  }
+
   async function runGrokJob(runId, job, requestTemplate) {
-    console.log('[injected] runGrokJob called', { runId, jobId: job?.id, templateUrl: requestTemplate?.url });
+    debugLog('runGrokJob called', { runId, jobId: job?.id, templateUrl: requestTemplate?.url });
     if (!job || typeof job.id !== 'string') {
       return;
     }
@@ -174,7 +396,7 @@
     });
     markPageTiming(runId, job.id, jobTimings, 'grokResponseHeadersAt');
 
-    console.log('[injected] directGrokFetch response', {
+    debugLog('directGrokFetch response', {
       status: response.status,
       statusText: response.statusText,
       contentType: response.headers.get('content-type'),
@@ -182,6 +404,32 @@
     });
 
     return response;
+  }
+
+  async function runNativeTimingProbe(runId, prompt, requestTemplate) {
+    try {
+      if (!requestTemplate || typeof requestTemplate.url !== 'string' || !requestTemplate.body) {
+        throw new Error('Missing captured Grok request template.');
+      }
+
+      const probePrompt = typeof prompt === 'string' && prompt.trim() ? prompt.trim() : 'Say one word.';
+      const payload = buildPayload(requestTemplate.body, probePrompt, '');
+      const response = await window.fetch(buildRequestUrl(requestTemplate.url, ''), {
+        method: 'POST',
+        credentials: 'include',
+        headers: buildHeaders(requestTemplate.headers),
+        referrer: buildReferrer(requestTemplate.referer, ''),
+        body: JSON.stringify(payload),
+      });
+
+      await response.text().catch(() => '');
+      debugLog('native timing probe complete', { runId, status: response.status });
+    } catch (error) {
+      debugLog('native timing probe failed', {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async function runGrokJobThroughUi(runId, job) {
@@ -475,6 +723,17 @@
     );
   }
 
+  function postNativeTiming(detail) {
+    window.postMessage(
+      {
+        source: PAGE_SOURCE,
+        type: 'GROK_NATIVE_TIMING',
+        detail,
+      },
+      location.origin,
+    );
+  }
+
   function postTiming(runId, jobId, timings) {
     postPageMessage('GROK_JOB_TIMING', runId, jobId, { timings });
   }
@@ -498,6 +757,20 @@
       return true;
     }
     return Boolean(job?.conversationId && job?.parentResponseId);
+  }
+
+  function isDebugEnabled() {
+    try {
+      return window.localStorage.getItem(DEBUG_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  function debugLog(message, detail) {
+    if (isDebugEnabled()) {
+      console.log(`[opencode-grok-auth] ${message}`, detail);
+    }
   }
 
   function randomId() {

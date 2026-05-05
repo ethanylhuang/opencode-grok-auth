@@ -1,0 +1,93 @@
+{
+  "generatedAt": "2026-05-04T18:06:20.542Z",
+  "url": "http://127.0.0.1:11434/v1/chat/completions",
+  "model": "grok-latest-new",
+  "samplesRequested": 1,
+  "attempts": 1,
+  "successfulSamples": 1,
+  "failedSamples": 0,
+  "samples": [
+    {
+      "index": 1,
+      "ok": true,
+      "jobId": "b06eb166-8018-4490-be1f-fda584f3363e",
+      "ttftMs": 296.79170799999997,
+      "contentTtftMs": 13180.018833,
+      "totalMs": 14338.7315,
+      "dispatchMs": 0,
+      "upstreamToSseMs": 72,
+      "bridgeVisibleOverheadMs": 2,
+      "phases": {
+        "requestReceivedAt": 1,
+        "jobQueuedAt": 2,
+        "jobAssignedAt": 2,
+        "workerNotifiedAt": 2,
+        "streamHeadersFlushedAt": 2,
+        "workerAcceptedAt": 2,
+        "contentScriptAcceptedAt": 5,
+        "grokFetchStartedAt": 6,
+        "grokResponseHeadersAt": 222,
+        "firstRawUpstreamChunkAt": 223,
+        "firstParsedReasoningTokenAt": 295,
+        "firstSseChunkAt": 295,
+        "firstParsedNonThinkingTokenAt": 13179
+      }
+    }
+  ],
+  "summary": {
+    "ttftMs": {
+      "count": 1,
+      "p50": 296.79170799999997,
+      "p95": 296.79170799999997,
+      "p99": 296.79170799999997,
+      "min": 296.79170799999997,
+      "max": 296.79170799999997
+    },
+    "contentTtftMs": {
+      "count": 1,
+      "p50": 13180.018833,
+      "p95": 13180.018833,
+      "p99": 13180.018833,
+      "min": 13180.018833,
+      "max": 13180.018833
+    },
+    "dispatchMs": {
+      "count": 1,
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "min": 0,
+      "max": 0
+    },
+    "upstreamToSseMs": {
+      "count": 1,
+      "p50": 72,
+      "p95": 72,
+      "p99": 72,
+      "min": 72,
+      "max": 72
+    },
+    "bridgeVisibleOverheadMs": {
+      "count": 1,
+      "p50": 2,
+      "p95": 2,
+      "p99": 2,
+      "min": 2,
+      "max": 2
+    }
+  },
+  "comparison": {
+    "nativeEndpoint": {
+      "url": "http://127.0.0.1:11434/bridge/native-timings",
+      "count": 0,
+      "summary": {
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "min": null,
+        "max": null
+      },
+      "deltaP50Ms": null
+    }
+  }
+}

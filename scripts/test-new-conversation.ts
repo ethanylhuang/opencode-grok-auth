@@ -4,6 +4,7 @@ let handleRequest: typeof import('../src/proxy').handleRequest;
 
 async function main() {
   process.env.GROK_DISABLE_TEMPLATE_RECOVERY = '1';
+  process.env.GROK_FAST_PATH = process.env.GROK_FAST_PATH ?? '0';
   ({ handleRequest } = await import('../src/proxy'));
 
   console.log('=== STEP 1: Send request without bridge (should fail) ===');
@@ -24,6 +25,8 @@ async function main() {
     activeGrokTab: true,
     hasRequestTemplate: true,
     url: 'https://grok.com/c/test',
+    manifestVersion: '0.1.11',
+    backgroundCodeVersion: 'm4-push-port-v8',
   });
 
   console.log('=== STEP 3: Submit /new template to proxy ===');
@@ -229,7 +232,7 @@ async function main() {
   }
   console.log('PASS: New chat continuation carries isolated chat metadata\n');
 
-  console.log('=== STEP 9: Verify OLD conversations still use regular template ===');
+  console.log('=== STEP 9: Verify no-session requests start from /new template ===');
   await postJson('/bridge/template', {
     url: 'https://grok.com/rest/app-chat/conversations/old-conv-123/responses',
     body: {
@@ -253,19 +256,49 @@ async function main() {
   const oldJob = await getJson('/bridge/jobs?workerId=test-extension');
   console.log(`Old job requestTemplate URL: ${oldJob.requestTemplate?.url}`);
 
-  if (!oldJob.requestTemplate?.url?.includes('/responses')) {
-    throw new Error(`Expected old job to get regular template, got ${oldJob.requestTemplate?.url}`);
+  if (oldJob.requestTemplate?.url !== 'https://grok.com/rest/app-chat/conversations/new') {
+    throw new Error(`Expected no-session job to use /new template, got ${oldJob.requestTemplate?.url}`);
   }
   if (oldJob.conversationId !== null || oldJob.parentResponseId !== null) {
-    throw new Error(`Expected old non-session job to omit routing fields, got ${JSON.stringify(oldJob)}`);
+    throw new Error(`Expected no-session job to omit routing fields, got ${JSON.stringify(oldJob)}`);
   }
-  console.log('PASS: Old conversations still work correctly\n');
+  console.log('PASS: No-session grok-latest requests start from /new template\n');
 
   await postJson(`/bridge/jobs/${oldJob.id}/chunks`, {
     chunk: '{"result":{"token":"Old response"}}',
   });
   await postJson(`/bridge/jobs/${oldJob.id}/complete`, { ok: true });
   await oldChat.finished;
+
+  console.log('=== STEP 10: Verify existing conversations still use regular template ===');
+  const oldContinuation = startRequest('POST', '/v1/chat/completions', {
+    model: 'grok-latest',
+    stream: true,
+    conversationId: 'old-conv-123',
+    parentResponseId: 'parent-123',
+    messages: [{ role: 'user', content: 'Continue old chat.' }],
+  });
+
+  await sleep(0);
+
+  const oldContinuationJob = await getJson('/bridge/jobs?workerId=test-extension');
+  console.log(`Old continuation requestTemplate URL: ${oldContinuationJob.requestTemplate?.url}`);
+
+  if (!oldContinuationJob.requestTemplate?.url?.includes('/responses')) {
+    throw new Error(
+      `Expected existing conversation job to get regular template, got ${oldContinuationJob.requestTemplate?.url}`,
+    );
+  }
+  if (oldContinuationJob.conversationId !== 'old-conv-123' || oldContinuationJob.parentResponseId !== 'parent-123') {
+    throw new Error(`Expected existing conversation routing fields, got ${JSON.stringify(oldContinuationJob)}`);
+  }
+  console.log('PASS: Existing conversations still use regular template\n');
+
+  await postJson(`/bridge/jobs/${oldContinuationJob.id}/chunks`, {
+    chunk: '{"result":{"token":"Old continuation"}}',
+  });
+  await postJson(`/bridge/jobs/${oldContinuationJob.id}/complete`, { ok: true });
+  await oldContinuation.finished;
 
   console.log('ALL TESTS PASSED');
 }

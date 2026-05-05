@@ -1,16 +1,25 @@
 const BRIDGE_ORIGIN = 'http://127.0.0.1:11434';
 const WORKER_ID = getWorkerId();
-const BACKGROUND_CODE_VERSION = 'chat-session-routing-v1';
+const BACKGROUND_CODE_VERSION = 'm4-push-port-v8';
 const POLL_BACKOFF_MS = 1000;
+const HEARTBEAT_INTERVAL_MS = 5000;
 const JOB_RUN_TIMEOUT_MS = 180000;
+const PUSH_RETRY_MS = 1000;
+const PUSH_RETRY_WINDOW_MS = 5000;
+const FAST_PATH_DISABLED_STORAGE_KEY = 'opencodeGrokAuthDisableFastPath';
+const NATIVE_TIMING_QUEUE_STORAGE_KEY = 'opencodeGrokAuthPendingNativeTimings';
+const MAX_NATIVE_TIMING_QUEUE = 20;
+const REQUIRED_CONTENT_SCRIPT_VERSION = 'm4-content-v4';
 
 let lastObservedRequest = null;
 let lastObservedNewRequest = null;
 let lastTemplateInstallSource = '';
 let lastTemplateInstallError = '';
-let polling = false;
+let bridgeStarted = false;
 const activeJobs = new Map();
 const jobPostChains = new Map();
+const activeJobPorts = new Map();
+let nativeTimingFlushActive = false;
 
 chrome.storage.local.get(['lastObservedRequest', 'lastObservedNewRequest'], (result) => {
   if (isValidObservedRequest(result.lastObservedRequest)) {
@@ -27,11 +36,11 @@ chrome.storage.local.get(['lastObservedRequest', 'lastObservedNewRequest'], (res
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  startPolling();
+  startBridge();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  startPolling();
+  startBridge();
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
@@ -41,6 +50,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
   if (message.type === 'grok-request-observed') {
     rememberObservedRequest(message.detail);
+    return false;
+  }
+
+  if (message.type === 'grok-native-timing') {
+    void postNativeTiming(message.detail);
     return false;
   }
 
@@ -88,7 +102,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   return false;
 });
 
-startPolling();
+startBridge();
 
 function getWorkerId() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
@@ -133,6 +147,19 @@ function updateTab(tabId, updateProperties) {
   });
 }
 
+function createTab(createProperties) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.create(createProperties, (tab) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      resolve(tab);
+    });
+  });
+}
+
 async function findGrokTab() {
   const tabs = await queryTabs({});
   const grokTabs = tabs.filter((tab) => {
@@ -143,6 +170,54 @@ async function findGrokTab() {
   }
 
   return grokTabs.find((tab) => tab.active) || grokTabs[0];
+}
+
+async function prewarmGrokTab() {
+  let tab = await findGrokTab();
+  let created = false;
+  if (!tab || typeof tab.id !== 'number') {
+    tab = await createTab({ url: 'https://grok.com/', active: true });
+    created = true;
+  } else {
+    await updateTab(tab.id, { active: true });
+  }
+
+  if (tab && typeof tab.id === 'number') {
+    await waitForTabUrl(tab.id, 'https://grok.com/');
+    await ensureContentScript(tab.id).catch(() => {});
+  }
+
+  await postHeartbeat().catch(() => {});
+}
+
+async function runNativeTimingProbe(payload) {
+  const requestTemplate = lastObservedNewRequest || lastObservedRequest;
+  if (!requestTemplate) {
+    return;
+  }
+
+  let tab = await findGrokTab();
+  let created = false;
+  if (!tab || typeof tab.id !== 'number') {
+    tab = await createTab({ url: 'https://grok.com/', active: true });
+    created = true;
+  } else {
+    await updateTab(tab.id, { active: true });
+  }
+
+  if (!tab || typeof tab.id !== 'number') {
+    return;
+  }
+
+  if (created) {
+    await waitForTabUrl(tab.id, 'https://grok.com/');
+  }
+  await ensureContentScript(tab.id);
+  await sendTabMessage(tab.id, {
+    type: 'run-native-timing-probe',
+    prompt: typeof payload?.prompt === 'string' && payload.prompt.trim() ? payload.prompt.trim() : 'Say one word.',
+    requestTemplate,
+  });
 }
 
 function rememberObservedRequest(detail) {
@@ -279,6 +354,18 @@ async function bridgeFetch(path, options = {}) {
   });
 }
 
+function storageGet(keys) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(keys, (result) => resolve(result || {}));
+  });
+}
+
+function storageSet(values) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set(values, () => resolve());
+  });
+}
+
 async function postHeartbeat() {
   const tab = await findGrokTab();
   const response = await bridgeFetch('/bridge/heartbeat', {
@@ -313,11 +400,14 @@ async function postHeartbeat() {
         installObservedRequest(body.newTemplateOverride, 'proxy-new-template-override');
       }
     }
+    void flushNativeTimingQueue();
   }
 }
 
-async function pollJob() {
-  const response = await bridgeFetch(`/bridge/jobs?workerId=${encodeURIComponent(WORKER_ID)}`);
+async function pollJob(fallback = false, timeoutMs = '') {
+  const fallbackParam = fallback ? '&fallback=1' : '';
+  const timeoutParam = typeof timeoutMs === 'number' ? `&timeoutMs=${encodeURIComponent(String(timeoutMs))}` : '';
+  const response = await bridgeFetch(`/bridge/jobs?workerId=${encodeURIComponent(WORKER_ID)}${fallbackParam}${timeoutParam}`);
   if (response.status === 204) {
     return null;
   }
@@ -325,6 +415,20 @@ async function pollJob() {
     throw new Error(`Bridge job poll failed: ${response.status}`);
   }
   return response.json();
+}
+
+async function postJobAccept(jobId, timings) {
+  if (typeof jobId !== 'string') {
+    return;
+  }
+
+  await bridgeFetch(`/bridge/jobs/${encodeURIComponent(jobId)}/accept`, {
+    method: 'POST',
+    body: JSON.stringify({
+      workerId: WORKER_ID,
+      timings: sanitizeTimings(timings),
+    }),
+  }).catch(() => {});
 }
 
 async function postJobChunk(jobId, chunk, timings) {
@@ -369,18 +473,88 @@ async function postJobComplete(jobId, ok, error) {
   }).catch(() => {});
 }
 
-async function runJobInGrokTab(job) {
-  console.log('[bridge] runJobInGrokTab', { jobId: job.id, model: job.model });
+async function postNativeTiming(detail) {
+  if (!detail || typeof detail !== 'object') {
+    return;
+  }
 
+  const payload = nativeTimingPayload(detail);
+  try {
+    await postNativeTimingPayload(payload);
+  } catch {
+    await queueNativeTiming(payload);
+  }
+}
+
+function nativeTimingPayload(detail) {
+  return {
+    workerId: WORKER_ID,
+    url: typeof detail.url === 'string' ? detail.url : '',
+    status: typeof detail.status === 'number' ? detail.status : null,
+    timings: sanitizeTimings(detail.timings),
+    error: typeof detail.error === 'string' ? detail.error : undefined,
+    queuedAt: Date.now(),
+  };
+}
+
+async function postNativeTimingPayload(payload) {
+  const response = await bridgeFetch('/bridge/native-timing', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`Bridge native timing post failed: ${response.status}`);
+  }
+}
+
+async function queueNativeTiming(payload) {
+  const result = await storageGet([NATIVE_TIMING_QUEUE_STORAGE_KEY]);
+  const existing = Array.isArray(result[NATIVE_TIMING_QUEUE_STORAGE_KEY])
+    ? result[NATIVE_TIMING_QUEUE_STORAGE_KEY]
+    : [];
+  const queue = [...existing, payload].slice(-MAX_NATIVE_TIMING_QUEUE);
+  await storageSet({ [NATIVE_TIMING_QUEUE_STORAGE_KEY]: queue });
+}
+
+async function flushNativeTimingQueue() {
+  if (nativeTimingFlushActive) {
+    return;
+  }
+
+  nativeTimingFlushActive = true;
+  try {
+    const result = await storageGet([NATIVE_TIMING_QUEUE_STORAGE_KEY]);
+    const queue = Array.isArray(result[NATIVE_TIMING_QUEUE_STORAGE_KEY])
+      ? result[NATIVE_TIMING_QUEUE_STORAGE_KEY]
+      : [];
+    if (queue.length === 0) {
+      return;
+    }
+
+    const remaining = [];
+    for (let index = 0; index < queue.length; index += 1) {
+      const payload = queue[index];
+      try {
+        await postNativeTimingPayload(payload);
+      } catch {
+        remaining.push(...queue.slice(index));
+        break;
+      }
+    }
+    await storageSet({ [NATIVE_TIMING_QUEUE_STORAGE_KEY]: remaining });
+  } finally {
+    nativeTimingFlushActive = false;
+  }
+}
+
+async function runJobInGrokTab(job) {
   const isNew = job.model === 'grok-latest-new';
   const fallbackTemplate = isNew
     ? lastObservedNewRequest
     : job.conversationId
       ? lastObservedRequest || lastObservedNewRequest
-      : lastObservedRequest;
+      : lastObservedNewRequest || lastObservedRequest;
   const requestTemplate = isValidObservedRequest(job.requestTemplate) ? job.requestTemplate : fallbackTemplate;
-
-  console.log('[bridge] template', { isNew, templateUrl: requestTemplate?.url });
 
   if (!requestTemplate) {
     await postJobComplete(
@@ -411,16 +585,14 @@ async function runJobInGrokTab(job) {
   const completion = waitForActiveJob(job.id);
 
   try {
-    const response = await sendTabMessage(tab.id, {
+    const port = connectJobPort(tab.id, job.id);
+    activeJobPorts.set(job.id, port);
+    attachJobPort(job.id, port);
+    port.postMessage({
       type: 'run-grok-job',
       job,
       requestTemplate,
     });
-
-    if (!response || response.ok !== true) {
-      throw new Error('Grok content script did not accept the bridge job.');
-    }
-    void postJobTiming(job.id, response.timings);
   } catch (error) {
     finishActiveJob(job.id);
     await postJobComplete(job.id, false, errorMessage(error));
@@ -477,7 +649,7 @@ function waitForActiveJob(jobId) {
 async function ensureContentScript(tabId) {
   try {
     const response = await sendTabMessage(tabId, { type: 'ping-content-script' });
-    if (response && response.ok === true) {
+    if (response && response.ok === true && response.contentScriptVersion === REQUIRED_CONTENT_SCRIPT_VERSION) {
       return;
     }
   } catch {
@@ -499,9 +671,71 @@ async function ensureContentScript(tabId) {
     });
   });
 
-  const response = await sendTabMessage(tabId, { type: 'ping-content-script' });
-  if (!response || response.ok !== true) {
-    throw new Error('content script injection did not respond.');
+  // Successful injection is enough here. Existing stale content listeners may also
+  // respond to pings, so a second ping can race with the fresh listener.
+}
+
+function connectJobPort(tabId, jobId) {
+  if (!chrome.tabs || typeof chrome.tabs.connect !== 'function') {
+    throw new Error('chrome.tabs.connect is unavailable.');
+  }
+  return chrome.tabs.connect(tabId, { name: `grok-job:${jobId}` });
+}
+
+function attachJobPort(jobId, port) {
+  port.onMessage.addListener((message) => {
+    void handleJobPortMessage(jobId, message);
+  });
+
+  port.onDisconnect.addListener(() => {
+    activeJobPorts.delete(jobId);
+    if (activeJobs.has(jobId)) {
+      void postJobComplete(jobId, false, 'Grok content Port disconnected before completion.');
+      finishActiveJob(jobId);
+    }
+  });
+}
+
+async function handleJobPortMessage(jobId, message) {
+  if (!message || typeof message !== 'object' || !activeJobs.has(jobId)) {
+    return;
+  }
+
+  if (message.type === 'grok-job-accepted') {
+    await postJobTiming(jobId, message.timings);
+    return;
+  }
+
+  if (message.type === 'grok-job-chunk') {
+    await enqueueJobPost(jobId, async () => {
+      try {
+        await postJobChunk(jobId, message.chunk, message.timings);
+      } catch (error) {
+        await postJobComplete(jobId, false, errorMessage(error));
+        finishActiveJob(jobId);
+      }
+    });
+    return;
+  }
+
+  if (message.type === 'grok-job-complete') {
+    await enqueueJobPost(jobId, async () => {
+      await postJobComplete(jobId, true);
+      finishActiveJob(jobId);
+    });
+    return;
+  }
+
+  if (message.type === 'grok-job-error') {
+    await enqueueJobPost(jobId, async () => {
+      await postJobComplete(jobId, false, message.error);
+      finishActiveJob(jobId);
+    });
+    return;
+  }
+
+  if (message.type === 'grok-job-timing') {
+    await postJobTiming(jobId, message.timings);
   }
 }
 
@@ -511,6 +745,14 @@ function finishActiveJob(jobId) {
     return;
   }
   activeJobs.delete(jobId);
+  const port = activeJobPorts.get(jobId);
+  if (port) {
+    activeJobPorts.delete(jobId);
+    try {
+      port.disconnect();
+    } catch {
+    }
+  }
   jobPostChains.delete(jobId);
   finish();
 }
@@ -545,22 +787,150 @@ function sanitizeTimings(timings) {
   return clean;
 }
 
-async function startPolling() {
-  if (polling) {
+async function startBridge() {
+  if (bridgeStarted) {
     return;
   }
 
-  polling = true;
+  bridgeStarted = true;
+  void heartbeatLoop();
+  void controlLoop();
+}
 
+async function heartbeatLoop() {
   while (true) {
     try {
       await postHeartbeat();
-      const job = await pollJob();
+      await sleep(HEARTBEAT_INTERVAL_MS);
+    } catch {
+      await sleep(POLL_BACKOFF_MS);
+    }
+  }
+}
+
+async function controlLoop() {
+  while (true) {
+    if (!(await isFastPathLocallyDisabled())) {
+      try {
+        await runPushSession();
+        continue;
+      } catch {
+        await sleep(PUSH_RETRY_MS);
+      }
+    }
+
+    await runFallbackPollingWindow();
+  }
+}
+
+async function runPushSession() {
+  const response = await bridgeFetch(
+    `/bridge/events?workerId=${encodeURIComponent(WORKER_ID)}&capabilities=push,port-v1`,
+    {
+      method: 'GET',
+      headers: { Accept: 'text/event-stream' },
+    },
+  );
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Bridge push channel failed: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const read = await reader.read();
+    if (read.done) {
+      break;
+    }
+
+    buffer += decoder.decode(read.value, { stream: true });
+    buffer = processControlBuffer(buffer, false);
+  }
+
+  buffer += decoder.decode();
+  processControlBuffer(buffer, true);
+}
+
+async function runFallbackPollingWindow() {
+  const startedAt = Date.now();
+
+  while ((await isFastPathLocallyDisabled()) || Date.now() - startedAt < PUSH_RETRY_WINDOW_MS) {
+    try {
+      const job = await pollJob(true, 1000);
       if (job) {
+        void postJobAccept(job.id, { workerAcceptedAt: Date.now() });
         await runJobInGrokTab(job);
       }
     } catch {
       await sleep(POLL_BACKOFF_MS);
     }
   }
+}
+
+function processControlBuffer(buffer, flush) {
+  const parts = buffer.split(/\r?\n\r?\n/);
+  const remainder = flush ? '' : parts.pop() || '';
+
+  for (const part of parts) {
+    void handleControlFrame(part);
+  }
+
+  if (flush && parts.length === 0 && buffer.trim()) {
+    void handleControlFrame(buffer);
+  }
+
+  return remainder;
+}
+
+async function handleControlFrame(frame) {
+  const lines = frame.split('\n').map((line) => line.replace(/\r$/, ''));
+  let eventName = 'message';
+  const dataLines = [];
+
+  for (const line of lines) {
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (dataLines.length === 0) {
+    return;
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(dataLines.join('\n'));
+  } catch {
+    return;
+  }
+
+  if (eventName === 'job') {
+    void postJobAccept(payload.id, { workerAcceptedAt: Date.now() });
+    await runJobInGrokTab(payload);
+    return;
+  }
+
+  if (eventName === 'prewarm') {
+    await prewarmGrokTab();
+    return;
+  }
+
+  if (eventName === 'native-probe') {
+    await runNativeTimingProbe(payload);
+  }
+}
+
+function isFastPathLocallyDisabled() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([FAST_PATH_DISABLED_STORAGE_KEY], (result) => {
+      resolve(result && result[FAST_PATH_DISABLED_STORAGE_KEY] === true);
+    });
+  });
 }

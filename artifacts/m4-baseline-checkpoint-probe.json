@@ -1,0 +1,60 @@
+{
+  "generatedAt": "2026-05-04T07:01:09.999Z",
+  "url": "http://127.0.0.1:11434/v1/chat/completions",
+  "model": "grok-latest",
+  "samplesRequested": 1,
+  "attempts": 1,
+  "successfulSamples": 0,
+  "failedSamples": 1,
+  "samples": [
+    {
+      "index": 1,
+      "ok": false,
+      "jobId": "78ed688a-388d-4172-abd5-0ba68e5399cf",
+      "ttftMs": null,
+      "totalMs": 485.11241600000005,
+      "dispatchMs": null,
+      "upstreamToSseMs": null,
+      "bridgeVisibleOverheadMs": null,
+      "phases": {},
+      "error": "Grok upstream returned HTTP 429: {\"error\":{\"code\":8,\"message\":\"Too many requests\",\"details\":[]}}\n"
+    }
+  ],
+  "summary": {
+    "ttftMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "dispatchMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "upstreamToSseMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "bridgeVisibleOverheadMs": {
+      "count": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    }
+  },
+  "comparison": {
+    "note": "Send a normal grok.com message with the extension loaded, or set GROK_LATENCY_BASELINE, GROK_LATENCY_NATIVE_REPORT, or GROK_NATIVE_TTFT_MS for comparison."
+  }
+}

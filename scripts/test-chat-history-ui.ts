@@ -5,6 +5,7 @@ import * as vm from 'node:vm';
 type MockChatResponse = {
   conversationId?: string;
   responseId?: string;
+  reasoning?: string;
   text: string;
 };
 
@@ -12,7 +13,7 @@ const MISSING_METADATA_WARNING =
   'Warning: Grok returned a first response without continuation metadata. This chat cannot be continued; restart the proxy, create a new chat, and send the first prompt again.';
 
 const responses: MockChatResponse[] = [
-  { conversationId: 'conv-alpha', responseId: 'resp-alpha-1', text: 'Alpha answer 1' },
+  { conversationId: 'conv-alpha', responseId: 'resp-alpha-1', reasoning: 'Thinking alpha', text: 'Alpha answer 1' },
   { conversationId: 'conv-alpha', responseId: 'resp-alpha-2', text: 'Alpha answer 2' },
   { conversationId: 'conv-beta', responseId: 'resp-beta-1', text: 'Beta answer 1' },
   { conversationId: 'conv-alpha', responseId: 'resp-alpha-3', text: 'Alpha answer 3' },
@@ -31,7 +32,7 @@ async function main() {
   });
   assertNewConversationCount(requests, 1);
   assertSession(sessions(store), 'conv-alpha', 'resp-alpha-1', 'Alpha one', ['Alpha one', 'Alpha answer 1']);
-  assertTranscript(harness, ['Alpha one', 'Alpha answer 1']);
+  assertTranscript(harness, ['Alpha one', 'Thinking alpha', 'Alpha answer 1']);
 
   await sendPrompt(harness, 'Alpha two');
   assertRequest(requests[1], {
@@ -46,7 +47,7 @@ async function main() {
     'Alpha two',
     'Alpha answer 2',
   ]);
-  assertTranscript(harness, ['Alpha one', 'Alpha answer 1', 'Alpha two', 'Alpha answer 2']);
+  assertTranscript(harness, ['Alpha one', 'Thinking alpha', 'Alpha answer 1', 'Alpha two', 'Alpha answer 2']);
 
   harness.elements.newChatBtn.click();
   await sendPrompt(harness, 'Beta one');
@@ -60,7 +61,7 @@ async function main() {
   assertTranscript(harness, ['Beta one', 'Beta answer 1']);
 
   clickChatByConversation(harness, 'conv-alpha');
-  assertTranscript(harness, ['Alpha one', 'Alpha answer 1', 'Alpha two', 'Alpha answer 2']);
+  assertTranscript(harness, ['Alpha one', 'Thinking alpha', 'Alpha answer 1', 'Alpha two', 'Alpha answer 2']);
   await sendPrompt(harness, 'Alpha three');
   assertRequest(requests[3], {
     model: 'grok-latest',
@@ -78,6 +79,7 @@ async function main() {
   ]);
   assertTranscript(harness, [
     'Alpha one',
+    'Thinking alpha',
     'Alpha answer 1',
     'Alpha two',
     'Alpha answer 2',
@@ -105,6 +107,7 @@ async function main() {
   clickChatByConversation(reloaded, 'conv-alpha');
   assertTranscript(reloaded, [
     'Alpha one',
+    'Thinking alpha',
     'Alpha answer 1',
     'Alpha two',
     'Alpha answer 2',
@@ -230,6 +233,9 @@ function createHarness(store: Record<string, string>, requests: any[], queuedRes
     setTimeout,
     String,
     TextDecoder,
+    window: {
+      confirm: () => true,
+    },
   });
 
   vm.runInContext(scriptMatch[1], context, { filename: 'web/index.html inline script' });
@@ -254,6 +260,7 @@ function makeElements() {
     'healthGrid',
     'healthDetail',
     'refreshHealthBtn',
+    'prewarmBtn',
     'newChatBtn',
     'chatList',
   ];
@@ -400,6 +407,11 @@ function sseResponse(response: MockChatResponse) {
 
   const body = [
     ...frames,
+    response.reasoning
+      ? `data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: response.reasoning }, index: 0, finish_reason: null }],
+        })}`
+      : '',
     `data: ${JSON.stringify({
       choices: [{ delta: { content: response.text }, index: 0, finish_reason: null }],
     })}`,

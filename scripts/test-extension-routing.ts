@@ -18,6 +18,8 @@ type Harness = {
 async function main() {
   await testDirectContinuationRouting();
   await testTrackedContinuationUiFallback();
+  await testNativeTimingCapture();
+  await testNativeTimingProbe();
   console.log('PASS extension routing');
 }
 
@@ -100,6 +102,81 @@ async function testTrackedContinuationUiFallback() {
   }
   if (!harness.posted.some((message) => message.type === 'GROK_JOB_CHUNK')) {
     throw new Error('Expected fallback streamed chunk postMessage');
+  }
+}
+
+async function testNativeTimingCapture() {
+  const harness = createHarness({
+    fetch: async (url, options) => streamResponse(
+      '{"result":{"token":"thinking","isThinking":true}}{"result":{"token":"native","isThinking":false}}',
+      url,
+      options,
+      harness.fetchCalls,
+    ),
+  });
+
+  void harness.windowObject.fetch('https://grok.com/rest/app-chat/conversations/native-test/responses', {
+    method: 'POST',
+    body: JSON.stringify({ message: 'Native timing' }),
+    headers: { 'content-type': 'application/json' },
+  });
+
+  await waitFor(() => harness.posted.some((message) => message.type === 'GROK_NATIVE_TIMING'));
+  const nativeTiming = harness.posted.find((message) => message.type === 'GROK_NATIVE_TIMING');
+  if (!nativeTiming.detail?.timings?.nativeFirstParsedOutputTokenAt) {
+    throw new Error(`Expected native first output timing, got ${JSON.stringify(nativeTiming)}`);
+  }
+  if (!nativeTiming.detail?.timings?.nativeFirstParsedVisibleTokenAt) {
+    throw new Error(`Expected native first visible timing, got ${JSON.stringify(nativeTiming)}`);
+  }
+}
+
+async function testNativeTimingProbe() {
+  const harness = createHarness({
+    fetch: async (url, options) => streamResponse(
+      '{"result":{"token":"probe thinking","isThinking":true}}{"result":{"token":"probe done","isThinking":false}}',
+      url,
+      options,
+      harness.fetchCalls,
+    ),
+  });
+
+  harness.messageHandler({
+    source: harness.windowObject,
+    data: {
+      source: 'opencode-grok-auth-extension',
+      type: 'RUN_NATIVE_TIMING_PROBE',
+      runId: 'native-probe-test',
+      prompt: 'Native probe prompt',
+      requestTemplate: {
+        url: 'https://grok.com/rest/app-chat/conversations/new',
+        body: {
+          message: '',
+          disableMemory: false,
+          forceConcise: false,
+        },
+        headers: {
+          accept: '*/*',
+          'content-type': 'application/json',
+          'x-xai-request-id': 'template-request-id',
+        },
+        referer: 'https://grok.com/',
+      },
+    },
+  });
+
+  await waitFor(() => harness.posted.some((message) => message.type === 'GROK_NATIVE_TIMING'));
+  const call = harness.fetchCalls[0];
+  if (!call || call.options?.__opencodeGrokBridgeReplay === true) {
+    throw new Error(`Expected native probe to use unmarked fetch, got ${JSON.stringify(call)}`);
+  }
+  const payload = JSON.parse(call.options.body);
+  if (payload.message !== 'Native probe prompt') {
+    throw new Error(`Expected native probe prompt payload, got ${JSON.stringify(payload)}`);
+  }
+  const nativeTiming = harness.posted.find((message) => message.type === 'GROK_NATIVE_TIMING');
+  if (!nativeTiming.detail?.timings?.nativeFirstParsedOutputTokenAt) {
+    throw new Error(`Expected native probe output timing, got ${JSON.stringify(nativeTiming)}`);
   }
 }
 
